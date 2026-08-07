@@ -18,7 +18,8 @@ clicking through the browser UI.
 3. The app connects to the live-search WebSocket for that query:
    `wss://www.pathofexile.com/api/trade/live/{league}/{search_id}`
 4. When new listings appear, GGG pushes a token over the socket, the app
-   plays a ping sound, and a card appears in the list.
+   plays `alert.mp3` (if present next to `live.py`; otherwise it falls back
+   to the system bell), and a card appears in the list.
 5. For each token, the app fetches listing details (including the
    `whisper_token`): `GET /api/trade/fetch/{token}?query={search_id}`
 6. When you click a card's button, the app sends the whisper / travel-to-
@@ -85,6 +86,11 @@ It does NOT guarantee you win the item. You can still fail because:
 
 7. Keep Path of Exile running and logged in on the same account whose
    cookies you imported.
+
+8. (Optional) Drop an `alert.mp3` file next to `live.py` to get a sound
+   alert whenever a new listing appears. Played via Windows' built-in media
+   control interface (`winmm.dll`) — no extra dependency needed. Without
+   the file, the app just uses the system bell instead.
 
 ## GGG API requirements (must comply)
 

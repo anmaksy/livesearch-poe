@@ -1,6 +1,7 @@
 """PoE Live Search — Direct Whisper Tool. See README.md for full docs."""
 
 import json
+import os
 import re
 import threading
 import time
@@ -17,6 +18,7 @@ DEFAULT_WS_USER_AGENT = (
 )
 LEAGUES_URL = "https://www.pathofexile.com/api/trade/data/leagues"
 DEFAULT_LEAGUES = ["Standard", "Hardcore"]
+ALERT_SOUND_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.mp3")
 
 
 def parse_trade_url(text: str):
@@ -274,11 +276,33 @@ class TradeApp(tk.Tk):
     # --------------------------------------------------------------- Ping --
 
     def _ping(self):
-        try:
-            import winsound
-            winsound.MessageBeep()
-        except Exception:
+        if not os.path.exists(ALERT_SOUND_PATH):
             self.bell()
+            return
+        threading.Thread(target=self._play_alert, daemon=True).start()
+
+    def _play_alert(self):
+        # Plays via the Windows Media Control Interface (winmm.dll) instead
+        # of a third-party mp3 package — no extra dependency, and it's
+        # built into every Windows install.
+        import ctypes
+
+        alias = "poe_livesearch_alert"
+        winmm = ctypes.WinDLL("winmm.dll")
+
+        def _mci(cmd):
+            buf = ctypes.create_unicode_buffer(128)
+            if winmm.mciSendStringW(cmd, buf, len(buf), 0) != 0:
+                raise RuntimeError(f"MCI command failed: {cmd!r}")
+
+        try:
+            _mci(f'open "{ALERT_SOUND_PATH}" type mpegvideo alias {alias}')
+            try:
+                _mci(f"play {alias} wait")
+            finally:
+                _mci(f"close {alias}")
+        except Exception:
+            self.after(0, self.bell)
 
     # ------------------------------------------------------------ Headers --
 
