@@ -44,7 +44,7 @@ It does NOT guarantee you win the item. You can still fail because:
 
 ## Setup
 
-1. Install dependencies:
+1. Install dependencies — double-click `install_dependencies.bat`, or run:
    ```
    pip install requests curl_cffi browser_cookie3
    ```
@@ -66,7 +66,8 @@ It does NOT guarantee you win the item. You can still fail because:
 2. Log into `pathofexile.com` normally in your regular browser (Firefox
    recommended — see Known limitations) if you haven't already.
 
-3. Run the app:
+3. Run the app — double-click `start_livesearch.bat` (launches with no
+   console window), or run:
    ```
    python live.py
    ```

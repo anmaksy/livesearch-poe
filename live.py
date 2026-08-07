@@ -3,12 +3,20 @@
 import json
 import os
 import re
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 import requests
 from curl_cffi import requests as cffi_requests
+
+# Launched via pythonw.exe (no console), sys.stdout/stderr are None, and
+# the print() calls below would raise. Redirect them somewhere harmless.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 
 # GGG API policy requires setting an identifiable User-Agent
 USER_AGENT = "PoeLiveSearchApp/1.0 (contact: guspisia@gmail.com)"
