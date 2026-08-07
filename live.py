@@ -139,7 +139,14 @@ class TradeApp(tk.Tk):
                     LEAGUES_URL, headers={"User-Agent": USER_AGENT}, timeout=10
                 )
                 res.raise_for_status()
-                leagues = [entry["id"] for entry in res.json().get("result", [])]
+                # The endpoint lists every league once per platform realm
+                # (pc/xbox/sony) with the same id, tripling the list. This
+                # tool only ever talks to www.pathofexile.com, so keep pc.
+                leagues = [
+                    entry["id"]
+                    for entry in res.json().get("result", [])
+                    if entry.get("realm", "pc") == "pc"
+                ]
             except Exception:
                 leagues = []
             if leagues:
