@@ -1,90 +1,4 @@
-"""
-PoE Live Search — Direct Whisper Tool
-=====================================
-
-Purpose
--------
-Bypass the trade website's "This item is in high demand" countdown by calling
-GGG's official trade API directly with your POESESSID, instead of clicking
-through the browser UI.
-
-How it works
-------------
-1. Connect to the live-search WebSocket for your saved trade query:
-   wss://www.pathofexile.com/api/trade/live/{league}/{search_id}
-
-2. When new listings appear, GGG pushes item IDs over the socket.
-
-3. For each ID batch, fetch listing details (including `whisper_token`):
-   GET /api/trade/fetch/{ids}?query={search_id}
-
-4. When you click the button, send the whisper / travel-to-hideout command:
-   POST /api/trade/whisper  body: {"token": "<whisper_token>"}
-
-   A 200 response means GGG accepted the action; the in-game client should
-   receive the whisper or hideout invite shortly after.
-
-Does the "in demand" bypass work?
----------------------------------
-Yes, for the usual case. The countdown on pathofexile.com/trade is enforced
-by the website frontend before it calls the same whisper endpoint this tool
-uses. Sending POST /api/trade/whisper yourself skips that UI delay.
-
-It does NOT guarantee you win the item. You can still fail because:
-  - The whisper_token expires quickly (seconds). Click fast.
-  - Someone else whispers first and buys the item.
-  - GGG rate-limits your account (HTTP 429) if you spam requests.
-  - The listing is gone, seller is offline, or token is invalid (4xx errors).
-  - Server-side anti-abuse may still throttle hot listings independently of
-    the visible countdown (rare, but possible).
-
-Setup
------
-1. Install dependencies:
-     pip install requests curl_cffi
-
-   curl_cffi is required instead of the `websockets` package: the live
-   WebSocket is proxied through Cloudflare, which fingerprints the TLS
-   handshake itself (JA3/JA4), not just headers/cookies. Plain Python
-   TLS (what `websockets`/`ssl` produce) gets flagged and the connection
-   is closed with code 1008 shortly after it opens, even with valid
-   cookies. curl_cffi can impersonate a real browser's TLS handshake.
-
-2. Set POESESSID below (or replace with os.environ["POESESSID"]).
-   Find it in browser DevTools → Application → Cookies → pathofexile.com.
-   Never share or commit this value; it is full account access.
-
-3. Set TRADE_URL to your live-search URL, e.g.:
-     https://www.pathofexile.com/trade/search/Standard/AbCdEf123
-   The league and search ID are parsed automatically from that URL.
-   Create the search on the trade site first, then click "Live Search" there
-   once to register interest — this tool replaces keeping that browser tab open.
-
-4. Run the script:
-     python "live.py"
-
-5. Keep Path of Exile running and logged in on the same account as POESESSID.
-
-GGG API requirements (must comply)
-----------------------------------
-  - Set a descriptive User-Agent with contact info (already configured).
-  - Respect rate limits; do not auto-spam whispers in a loop.
-  - Manual button click per item is intentional and safer for your account.
-
-Known limitations of this script
-----------------------------------
-  - Fetch endpoint accepts at most 10 item IDs per request (handled below).
-  - Reconnects automatically on disconnect (2s backoff), but does not
-    replay listings that appeared while offline.
-  - No rate-limit header parsing (429 responses are shown but not retried).
-  - Tkinter UI only; cards are not removed when listings expire.
-
-Terms of service
-----------------
-Automating in-game actions may violate GGG's Terms of Service. This tool sends
-the same API call the website would, but you are responsible for how you use
-it. Prefer manual clicks and reasonable request rates.
-"""
+"""PoE Live Search — Direct Whisper Tool. See README.md for full docs."""
 
 import json
 import re
@@ -95,47 +9,22 @@ from tkinter import messagebox, ttk
 import requests
 from curl_cffi import requests as cffi_requests
 
-# ==================== CONFIGURATION ====================
-POESESSID = "1dc4a279d8595af11d917c841f01cf8f"
-TRADE_URL = "https://www.pathofexile.com/trade/search/Allflame/Z6EjVJb9uQ/live"
-
 # GGG API policy requires setting an identifiable User-Agent
 USER_AGENT = "PoeLiveSearchApp/1.0 (contact: guspisia@gmail.com)"
-
-# The live-search WebSocket is not the documented trade API — it's the
-# same internal channel pathofexile.com's own JS uses, and it's proxied
-# through Cloudflare. Unlike the REST endpoints, it validates the
-# Cloudflare clearance cookie and closes with 1008 shortly after connect
-# if it's missing. Copy these from your browser's DevTools -> Network ->
-# (the live WS request) -> Headers -> Request Headers -> Cookie, and the
-# User-Agent from the same request. Both expire/rotate periodically and
-# are bound to the IP/browser that issued them, so re-copy them if the
-# socket starts closing with 1008 again.
-CF_CLEARANCE = "Q6J1qT335iRynvrLelyYJZ_OzIR5Pq5NJlmbWHOgoy4-1785825005-1.2.1.1-pQyg209nzWfIVeGNjHucs0oGgkcjclcUYcG6TJPMrwnBrIEXwTuiZlxCe.G582PmW.eIP3HbJ3CmRW1qLUIVro9VrkKf8yz3cZ92iUiCa6OoSSdVOvhrvI7UnA7GrM3Mwwrhx1F8WKuuegTcLk3q49zirVTk7_VDp6eV1JfKyNWausxQvRKIME3uQo8GGo7_F6YsQNDzL_Tha7g8C1QjUtMXaVGX9pwk33iE4XmsvxBorEyz7NP5L3BaCjnpAGKsau9L0fFTWTXI3oinjLyCxJFL8gGpQ8E.N9W4dyFwRl59E6CkwNHWPbGTDaPe_374MsareBpkM8c3qOoeCsMBqFOfv4.g6DCMItKF4x8eNXSWP7yzlDwQx7B4yqtnNW54l3Uo50XBKBCmPIj102lKp4KN4vjzEUGyVLzNk0CwBzksLz8t.WIrUEmJP6Ib3y8N0sXKMg0VZYJIVDw.k5lpeQ"
-POETOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJvYXV0aC9pbnRlcm5hbCIsImV4cCI6MTc4NTkxMTQwNCwiaWF0IjoxNzg1ODI1MDA0LCJpc3MiOiJ1cm46cGF0aG9mZXhpbGU6cHJvZHVjdGlvbiIsInJpZCI6IjU3OTE1M2IxODEyNjMwMjMwOGQ4ZjMyODRjYzkxZGJiIiwic2NvcGUiOiJpbnRlcm5hbCIsInN1YiI6ImIzM2ZjNjk4LTU0ZDMtNDVkMC05NTUzLTQ4ODg3MTViZTVhOSIsInZlcnNpb24iOiIxZjliYWEwYyIsImNsaWVudF9pZCI6ImludGVybmFsIiwicmVzcG9uc2VfdHlwZSI6ImludGVybmFsIn0.p2LuWn4W0DgoGfpqEmvb7OgE49jZPp540tmC5Fhsw31rXlF49w_3FHAaYAy3B1Hqj0_zdQsc0W6msRLDc2JO8g"
-WS_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
-# =======================================================
+# Fallback WS User-Agent, overwritten with the real one captured at login.
+DEFAULT_WS_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
+)
+LEAGUES_URL = "https://www.pathofexile.com/api/trade/data/leagues"
+DEFAULT_LEAGUES = ["Standard", "Hardcore"]
+LOGIN_TIMEOUT_S = 300
 
 
-def _api_headers(*, json_body: bool = False) -> dict:
-    """Headers GGG expects for trade API calls."""
-    headers = {
-        "Cookie": f"POESESSID={POESESSID}",
-        "User-Agent": USER_AGENT,
-        "Referer": "https://www.pathofexile.com/trade",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    if json_body:
-        headers["Content-Type"] = "application/json"
-    return headers
-
-
-def parse_trade_url(url: str):
-    """Extracts league and search_id from a PoE trade search URL."""
-    pattern = r"pathofexile\.com/trade/search/([^/]+)/([^/]+)"
-    match = re.search(pattern, url)
+def parse_trade_url(text: str):
+    """Extracts league and search_id from a PoE trade search URL, if present."""
+    match = re.search(r"pathofexile\.com/trade/search/([^/]+)/([^/?]+)", text)
     if not match:
-        raise ValueError("Invalid PoE trade search URL format.")
+        return None
     return match.group(1), match.group(2)
 
 
@@ -144,36 +33,78 @@ class TradeApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PoE Live Search - On-Demand Whisper Tool")
-        self.geometry("650x600")
+        self.geometry("700x650")
         self.attributes("-topmost", True)
 
-        self.league, self.search_id = parse_trade_url(TRADE_URL)
+        # Populated by the Login flow; required before Start will connect.
+        self.poesessid = None
+        self.cf_clearance = None
+        self.poetoken = None
+        self.ws_user_agent = DEFAULT_WS_USER_AGENT
 
-        # Build UI layout
+        self.league = None
+        self.search_id = None
+        self.is_running = False
+        self.ws_thread = None
+        self.current_ws = None
+
         self._setup_ui()
+        self._refresh_leagues()
 
-        # Start WebSocket listener thread
-        self.is_running = True
-        self.ws_thread = threading.Thread(
-            target=self._listen_websocket, daemon=True
-        )
-        self.ws_thread.start()
+    # ---------------------------------------------------------------- UI --
 
     def _setup_ui(self):
-        # Header Status
+        login_row = ttk.Frame(self, padding=(10, 10, 10, 0))
+        login_row.pack(fill=tk.X)
+
+        self.login_btn = ttk.Button(
+            login_row, text="Login", command=self._on_login_click
+        )
+        self.login_btn.pack(side=tk.LEFT)
+
+        self.login_status = ttk.Label(
+            login_row, text="Not logged in", foreground="red"
+        )
+        self.login_status.pack(side=tk.LEFT, padx=10)
+
+        connect_row = ttk.Frame(self, padding=10)
+        connect_row.pack(fill=tk.X)
+
+        ttk.Label(connect_row, text="League:").pack(side=tk.LEFT)
+        self.league_var = tk.StringVar()
+        self.league_combo = ttk.Combobox(
+            connect_row, textvariable=self.league_var, values=DEFAULT_LEAGUES,
+            width=16, state="normal",
+        )
+        self.league_combo.pack(side=tk.LEFT, padx=(5, 15))
+
+        ttk.Label(connect_row, text="Search ID / URL:").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(
+            connect_row, textvariable=self.search_var, width=24
+        )
+        self.search_entry.pack(side=tk.LEFT, padx=(5, 15), fill=tk.X, expand=True)
+
+        self.start_btn = ttk.Button(
+            connect_row, text="▶ Start", command=self._on_start_click
+        )
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.stop_btn = ttk.Button(
+            connect_row, text="■ Stop", command=self._on_stop_click,
+            state=tk.DISABLED,
+        )
+        self.stop_btn.pack(side=tk.LEFT)
+
         header = ttk.Frame(self, padding=10)
         header.pack(fill=tk.X)
 
-        ttk.Label(
-            header, text=f"League: {self.league}", font=("Arial", 10, "bold")
-        ).pack(side=tk.LEFT, padx=5)
-        ttk.Label(header, text=f"Search ID: {self.search_id}").pack(
-            side=tk.LEFT, padx=5
-        )
+        self.league_label = ttk.Label(header, text="League: -", font=("Arial", 10, "bold"))
+        self.league_label.pack(side=tk.LEFT, padx=5)
+        self.search_id_label = ttk.Label(header, text="Search ID: -")
+        self.search_id_label.pack(side=tk.LEFT, padx=5)
 
-        self.status_label = ttk.Label(
-            header, text="Connecting...", foreground="orange"
-        )
+        self.status_label = ttk.Label(header, text="Not connected", foreground="gray")
         self.status_label.pack(side=tk.RIGHT, padx=5)
 
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
@@ -198,6 +129,179 @@ class TradeApp(tk.Tk):
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+    # ------------------------------------------------------------ Leagues --
+
+    def _refresh_leagues(self):
+        def _fetch():
+            try:
+                res = requests.get(
+                    LEAGUES_URL, headers={"User-Agent": USER_AGENT}, timeout=10
+                )
+                res.raise_for_status()
+                leagues = [entry["id"] for entry in res.json().get("result", [])]
+            except Exception:
+                leagues = []
+            if leagues:
+                self.after(0, lambda: self._set_leagues(leagues))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _set_leagues(self, leagues):
+        self.league_combo["values"] = leagues
+        if not self.league_var.get():
+            self.league_var.set(leagues[0])
+
+    # -------------------------------------------------------------- Login --
+
+    def _on_login_click(self):
+        self.login_btn.config(state=tk.DISABLED)
+        self.login_status.config(text="Opening browser…", foreground="orange")
+        threading.Thread(target=self._do_login, daemon=True).start()
+
+    def _do_login(self):
+        try:
+            from selenium import webdriver
+        except ImportError:
+            self.after(
+                0,
+                lambda: self._login_failed(
+                    "selenium not installed (pip install selenium)"
+                ),
+            )
+            return
+
+        driver = None
+        cookies = {}
+        ua = None
+        try:
+            driver = webdriver.Edge()
+            driver.get("https://www.pathofexile.com/login")
+
+            deadline = time.time() + LOGIN_TIMEOUT_S
+            while time.time() < deadline:
+                time.sleep(1)
+                raw = driver.get_cookies()
+                cookies = {c["name"]: c["value"] for c in raw}
+                if "POESESSID" in cookies:
+                    break
+
+            if "POESESSID" in cookies:
+                # Visiting the trade site lets Cloudflare/GGG set the
+                # cf_clearance / POETOKEN cookies this tool also needs.
+                driver.get("https://www.pathofexile.com/trade")
+                time.sleep(3)
+                cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+                ua = driver.execute_script("return navigator.userAgent")
+        except Exception as e:
+            self.after(0, lambda: self._login_failed(str(e)))
+            return
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+        if "POESESSID" not in cookies:
+            self.after(
+                0,
+                lambda: self._login_failed(
+                    "Login window closed before POESESSID was captured."
+                ),
+            )
+            return
+
+        self.poesessid = cookies["POESESSID"]
+        self.cf_clearance = cookies.get("cf_clearance", "")
+        self.poetoken = cookies.get("POETOKEN", "")
+        if ua:
+            self.ws_user_agent = ua
+
+        self.after(0, self._login_success)
+
+    def _login_success(self):
+        self.login_status.config(text="✅ Logged in", foreground="green")
+        self.login_btn.config(state=tk.NORMAL, text="Re-login")
+        self._refresh_leagues()
+
+    def _login_failed(self, msg):
+        self.login_status.config(text=f"❌ {msg[:80]}", foreground="red")
+        self.login_btn.config(state=tk.NORMAL)
+
+    # --------------------------------------------------------- Start/Stop --
+
+    def _resolve_search(self, text, league):
+        text = text.strip()
+        if not text:
+            raise ValueError("Enter a search ID or paste a full trade URL.")
+        parsed = parse_trade_url(text)
+        if parsed:
+            return parsed
+        if not league:
+            raise ValueError("Select a league, or paste a full trade URL instead.")
+        return league, text
+
+    def _on_start_click(self):
+        if not self.poesessid:
+            messagebox.showwarning("Not logged in", "Click Login first.")
+            return
+        try:
+            league, search_id = self._resolve_search(
+                self.search_var.get(), self.league_var.get()
+            )
+        except ValueError as e:
+            messagebox.showerror("Invalid input", str(e))
+            return
+
+        self.league = league
+        self.search_id = search_id
+        self.league_label.config(text=f"League: {league}")
+        self.search_id_label.config(text=f"Search ID: {search_id}")
+
+        self.is_running = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.status_label.config(text="Connecting...", foreground="orange")
+
+        self.ws_thread = threading.Thread(target=self._listen_websocket, daemon=True)
+        self.ws_thread.start()
+
+    def _on_stop_click(self):
+        self.is_running = False
+        if self.current_ws is not None:
+            try:
+                self.current_ws.close()
+            except Exception:
+                pass
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_label.config(text="Stopped", foreground="gray")
+
+    # --------------------------------------------------------------- Ping --
+
+    def _ping(self):
+        try:
+            import winsound
+            winsound.MessageBeep()
+        except Exception:
+            self.bell()
+
+    # ------------------------------------------------------------ Headers --
+
+    def _api_headers(self, *, json_body: bool = False) -> dict:
+        """Headers GGG expects for trade API calls."""
+        headers = {
+            "Cookie": f"POESESSID={self.poesessid}",
+            "User-Agent": USER_AGENT,
+            "Referer": "https://www.pathofexile.com/trade",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    # ------------------------------------------------------------- Cards --
+
     def add_item_card(self, item_data):
         """Thread-safe UI update to insert a new item card."""
         self.after(0, self._create_card_widget, item_data)
@@ -207,6 +311,8 @@ class TradeApp(tk.Tk):
 
     def _create_card_widget(self, item):
         """Renders an item card with a manual action button."""
+        self._ping()
+
         card = ttk.LabelFrame(
             self.scroll_frame, text=item["name"], padding=10
         )
@@ -284,7 +390,7 @@ class TradeApp(tk.Tk):
 
         def _post():
             url = "https://www.pathofexile.com/api/trade/whisper"
-            headers = _api_headers(json_body=True)
+            headers = self._api_headers(json_body=True)
 
             try:
                 res = requests.post(url, json={"token": token}, headers=headers)
@@ -320,6 +426,8 @@ class TradeApp(tk.Tk):
 
         threading.Thread(target=_post, daemon=True).start()
 
+    # -------------------------------------------------------- WebSocket --
+
     def _listen_websocket(self):
         ws_url = f"wss://www.pathofexile.com/api/trade/live/{self.league}/{self.search_id}"
         # Only send headers a real browser WebSocket handshake can produce
@@ -328,15 +436,15 @@ class TradeApp(tk.Tk):
         # Cloudflare, which fingerprints the TLS handshake itself — plain
         # Python ssl gets closed with 1008 regardless of cookies, so this
         # uses curl_cffi's Firefox impersonation instead of `websockets`.
-        cookie_parts = [f"POESESSID={POESESSID}"]
-        if CF_CLEARANCE:
-            cookie_parts.append(f"cf_clearance={CF_CLEARANCE}")
-        if POETOKEN:
-            cookie_parts.append(f"POETOKEN={POETOKEN}")
+        cookie_parts = [f"POESESSID={self.poesessid}"]
+        if self.cf_clearance:
+            cookie_parts.append(f"cf_clearance={self.cf_clearance}")
+        if self.poetoken:
+            cookie_parts.append(f"POETOKEN={self.poetoken}")
 
         headers = {
             "Cookie": "; ".join(cookie_parts),
-            "User-Agent": WS_USER_AGENT,
+            "User-Agent": self.ws_user_agent,
             "Origin": "https://www.pathofexile.com",
         }
 
@@ -346,6 +454,7 @@ class TradeApp(tk.Tk):
             try:
                 session = cffi_requests.Session(impersonate="firefox135")
                 ws = session.ws_connect(ws_url, headers=headers)
+                self.current_ws = ws
 
                 self.after(
                     0,
@@ -373,7 +482,10 @@ class TradeApp(tk.Tk):
                         self._fetch_items(data["result"])
 
             except Exception as e:
-                print(f"WebSocket error: {e!r}")
+                if self.is_running:
+                    print(f"WebSocket error: {e!r}")
+            finally:
+                self.current_ws = None
 
             if not self.is_running:
                 break
@@ -392,7 +504,7 @@ class TradeApp(tk.Tk):
         result_token is the short-lived signed token from the live-search
         push message, used in place of a raw comma-separated ID list.
         """
-        headers = _api_headers()
+        headers = self._api_headers()
         fetch_url = (
             f"https://www.pathofexile.com/api/trade/fetch/{result_token}"
             f"?query={self.search_id}"
