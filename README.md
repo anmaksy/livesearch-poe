@@ -10,8 +10,9 @@ clicking through the browser UI.
 
 ## How it works
 
-1. Log in through the app's built-in **Login** button (opens a real browser
-   window) so the app can capture your session cookies for you.
+1. Click the app's built-in **Import Cookies** button so it can read your
+   session cookies straight out of your already-logged-in browser — no
+   copy-pasting from DevTools, and no separate browser window to log into.
 2. Pick a league and paste a search ID (or a full trade URL) into the app,
    then click **Start**.
 3. The app connects to the live-search WebSocket for that query:
@@ -44,7 +45,7 @@ It does NOT guarantee you win the item. You can still fail because:
 
 1. Install dependencies:
    ```
-   pip install requests curl_cffi selenium
+   pip install requests curl_cffi browser_cookie3
    ```
    - `curl_cffi` is required instead of the `websockets` package: the live
      WebSocket is proxied through Cloudflare, which fingerprints the TLS
@@ -52,35 +53,38 @@ It does NOT guarantee you win the item. You can still fail because:
      (what `websockets`/`ssl` produce) gets flagged and the connection is
      closed with code 1008 shortly after it opens, even with valid cookies.
      curl_cffi can impersonate a real browser's TLS handshake.
-   - `selenium` drives the login browser window. It launches whichever
-     browser is set as your Windows default (Chrome, Firefox, or Edge),
-     falling back to Edge if detection or launch fails. Selenium 4.6+
-     auto-downloads the matching driver (`chromedriver`/`geckodriver`/
-     `msedgedriver`) on first use — no manual driver setup required, as
-     long as that browser is installed.
+   - `browser_cookie3` reads cookies directly out of your installed
+     browsers' cookie storage (Firefox, then Edge, then Chrome, in that
+     order). An earlier version of this tool automated a browser with
+     Selenium to log in, but Cloudflare's challenge detects the WebDriver
+     protocol itself (Firefox even shows a "Browser is under remote
+     control" banner) and fails the check regardless of language/framework
+     — reading the cookies of a browser you're already logged into sidesteps
+     that entirely.
 
-2. Run the app:
+2. Log into `pathofexile.com` normally in your regular browser (Firefox
+   recommended — see Known limitations) if you haven't already.
+
+3. Run the app:
    ```
    python live.py
    ```
 
-3. Click **Login**. A browser window opens on the PoE login page — log in
-   there as normal (solve any Cloudflare challenge, 2FA, etc.). The app
-   polls the browser for your session cookies (`POESESSID`, `cf_clearance`,
-   `POETOKEN`) and closes the window automatically once it has them. Never
+4. Click **Import Cookies**. The app reads `POESESSID`, `cf_clearance`, and
+   `POETOKEN` from your browser's cookie store for `pathofexile.com`. Never
    share these values; they grant full account access.
 
-4. Pick your league from the dropdown (auto-populated from GGG's API), and
+5. Pick your league from the dropdown (auto-populated from GGG's API), and
    paste a search ID or a full trade URL (e.g.
    `https://www.pathofexile.com/trade/search/Standard/AbCdEf123`) into the
    search field. Create the search on the trade site first, and click "Live
    Search" there once to register interest — this tool replaces keeping
    that browser tab open.
 
-5. Click **Start** to connect. Click **Stop** to disconnect at any time.
+6. Click **Start** to connect. Click **Stop** to disconnect at any time.
 
-6. Keep Path of Exile running and logged in on the same account you used to
-   log in above.
+7. Keep Path of Exile running and logged in on the same account whose
+   cookies you imported.
 
 ## GGG API requirements (must comply)
 
@@ -95,16 +99,16 @@ It does NOT guarantee you win the item. You can still fail because:
   does not replay listings that appeared while offline.
 - No rate-limit header parsing (429 responses are shown but not retried).
 - Tkinter UI only; cards are not removed when listings expire.
-- Login capture relies on Selenium browser automation; if GGG changes its
-  cookie names or login flow, the capture step may need updates.
-- Cloudflare's challenge can detect the automated browser and loop
-  endlessly even after you solve it by hand. The app strips the common
-  automation tells (`navigator.webdriver`, the "enable-automation" info
-  bar) for Chrome/Edge, which resolves most cases, but Cloudflare's more
-  aggressive checks (Turnstile) can still flag it. If Login keeps getting
-  stuck on the challenge, try again after a minute (Cloudflare temp-bans
-  repeated failures), or log into pathofexile.com normally first in your
-  regular browser so the account itself isn't flagged.
+- **Import Cookies requires you to already be logged into pathofexile.com**
+  in Firefox, Edge, or Chrome — it reads existing cookies, it doesn't log
+  you in.
+- **Firefox is the most reliable source.** Chrome and Edge (Chromium 127+)
+  ship "App-Bound Encryption," which ties cookie decryption to the browser
+  binary itself and blocks most third-party cookie readers, including
+  `browser_cookie3`. If Import Cookies fails on Chrome/Edge, log into
+  pathofexile.com in Firefox instead and re-import.
+- Cookie-format/DB-schema changes in a future browser version could break
+  `browser_cookie3`'s extraction.
 
 ## Terms of service
 

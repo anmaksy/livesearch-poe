@@ -17,7 +17,6 @@ DEFAULT_WS_USER_AGENT = (
 )
 LEAGUES_URL = "https://www.pathofexile.com/api/trade/data/leagues"
 DEFAULT_LEAGUES = ["Standard", "Hardcore"]
-LOGIN_TIMEOUT_S = 300
 
 
 def parse_trade_url(text: str):
@@ -58,12 +57,12 @@ class TradeApp(tk.Tk):
         login_row.pack(fill=tk.X)
 
         self.login_btn = ttk.Button(
-            login_row, text="Login", command=self._on_login_click
+            login_row, text="Import Cookies", command=self._on_login_click
         )
         self.login_btn.pack(side=tk.LEFT)
 
         self.login_status = ttk.Label(
-            login_row, text="Not logged in", foreground="red"
+            login_row, text="No session imported", foreground="red"
         )
         self.login_status.pack(side=tk.LEFT, padx=10)
 
@@ -153,152 +152,70 @@ class TradeApp(tk.Tk):
 
     # -------------------------------------------------------------- Login --
 
+    # Launching an automated browser to log in gets flagged by Cloudflare's
+    # challenge as a bot (Selenium's WebDriver protocol — Marionette on
+    # Firefox, CDP on Chrome — is visible to the page and to the browser's
+    # own UI, which is why Firefox shows "Browser is under remote control").
+    # No amount of flag-hiding reliably beats that. Instead, this reads the
+    # session cookies straight out of your existing, already-logged-in
+    # browser's cookie storage — no automation involved, so there's nothing
+    # for Cloudflare to detect. Firefox is tried first because the WS
+    # connection below impersonates Firefox's TLS fingerprint, and
+    # cf_clearance can be tied to the browser it was issued to.
+    COOKIE_BROWSER_ORDER = ("firefox", "edge", "chrome")
+
     def _on_login_click(self):
         self.login_btn.config(state=tk.DISABLED)
-        self.login_status.config(text="Opening browser…", foreground="orange")
+        self.login_status.config(text="Reading browser cookies…", foreground="orange")
         threading.Thread(target=self._do_login, daemon=True).start()
-
-    def _detect_default_browser(self):
-        """Reads Windows' registered default browser for https links."""
-        try:
-            import winreg
-            key_path = (
-                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations"
-                r"\https\UserChoice"
-            )
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
-                prog_id, _ = winreg.QueryValueEx(key, "ProgId")
-        except Exception:
-            return "edge"
-
-        prog_id = prog_id.lower()
-        if "chrome" in prog_id:
-            return "chrome"
-        if "firefox" in prog_id:
-            return "firefox"
-        return "edge"
-
-    # Cloudflare's challenge fingerprints the automation markers Selenium
-    # leaves behind by default (navigator.webdriver, the "enable-automation"
-    # info bar, the automation extension) and fails the check even when a
-    # human solves it manually in the window. These flags/prefs strip the
-    # obvious tells; it's not a guarantee against every Cloudflare check,
-    # but it fixes the common "stuck in an endless challenge loop" case.
-    def _harden_chromium_options(self, options):
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
-        return options
-
-    def _hide_webdriver_flag(self, driver):
-        try:
-            driver.execute_cdp_cmd(
-                "Page.addScriptToEvaluateOnNewDocument",
-                {
-                    "source": (
-                        "Object.defineProperty(navigator, 'webdriver', "
-                        "{get: () => undefined})"
-                    )
-                },
-            )
-        except Exception:
-            pass  # Firefox (no CDP) or the browser doesn't support it.
-
-    def _launch_browser(self, webdriver):
-        """Launches the user's default browser, falling back to Edge."""
-        browser = self._detect_default_browser()
-        if browser == "chrome":
-            try:
-                from selenium.webdriver.chrome.options import Options
-                driver = webdriver.Chrome(
-                    options=self._harden_chromium_options(Options())
-                )
-                self._hide_webdriver_flag(driver)
-                return driver
-            except Exception:
-                pass
-        elif browser == "firefox":
-            try:
-                from selenium.webdriver.firefox.options import Options
-                options = Options()
-                options.set_preference("dom.webdriver.enabled", False)
-                return webdriver.Firefox(options=options)
-            except Exception:
-                pass
-
-        from selenium.webdriver.edge.options import Options
-        driver = webdriver.Edge(options=self._harden_chromium_options(Options()))
-        self._hide_webdriver_flag(driver)
-        return driver
 
     def _do_login(self):
         try:
-            from selenium import webdriver
+            import browser_cookie3
         except ImportError:
             self.after(
                 0,
                 lambda: self._login_failed(
-                    "selenium not installed (pip install selenium)"
+                    "browser_cookie3 not installed (pip install browser_cookie3)"
                 ),
             )
             return
 
-        driver = None
+        loaders = {
+            "firefox": browser_cookie3.firefox,
+            "edge": browser_cookie3.edge,
+            "chrome": browser_cookie3.chrome,
+        }
+
         cookies = {}
-        ua = None
-        try:
-            driver = self._launch_browser(webdriver)
-            driver.get("https://www.pathofexile.com/login")
-
-            deadline = time.time() + LOGIN_TIMEOUT_S
-            while time.time() < deadline:
-                time.sleep(1)
-                raw = driver.get_cookies()
-                cookies = {c["name"]: c["value"] for c in raw}
-                if "POESESSID" in cookies:
-                    break
-
-            if "POESESSID" in cookies:
-                # Visiting the trade site lets Cloudflare/GGG set the
-                # cf_clearance / POETOKEN cookies this tool also needs.
-                driver.get("https://www.pathofexile.com/trade")
-                time.sleep(3)
-                cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
-                ua = driver.execute_script("return navigator.userAgent")
-        except Exception as e:
-            # `e` is cleared by Python at the end of this except block, but
-            # the lambda below runs later via .after() — capture the text
-            # now, not inside the closure.
-            error_text = str(e)
-            self.after(0, lambda: self._login_failed(error_text))
-            return
-        finally:
-            if driver is not None:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+        last_error = ""
+        for name in self.COOKIE_BROWSER_ORDER:
+            try:
+                jar = loaders[name](domain_name="pathofexile.com")
+                found = {c.name: c.value for c in jar}
+            except Exception as e:
+                last_error = str(e)
+                continue
+            if "POESESSID" in found:
+                cookies = found
+                break
 
         if "POESESSID" not in cookies:
-            self.after(
-                0,
-                lambda: self._login_failed(
-                    "Login window closed before POESESSID was captured."
-                ),
-            )
+            msg = "No PoE session found. Log into pathofexile.com in Firefox/Edge/Chrome first."
+            if last_error:
+                msg += f" ({last_error[:60]})"
+            self.after(0, lambda: self._login_failed(msg))
             return
 
         self.poesessid = cookies["POESESSID"]
         self.cf_clearance = cookies.get("cf_clearance", "")
         self.poetoken = cookies.get("POETOKEN", "")
-        if ua:
-            self.ws_user_agent = ua
 
         self.after(0, self._login_success)
 
     def _login_success(self):
-        self.login_status.config(text="✅ Logged in", foreground="green")
-        self.login_btn.config(state=tk.NORMAL, text="Re-login")
+        self.login_status.config(text="✅ Cookies imported", foreground="green")
+        self.login_btn.config(state=tk.NORMAL, text="Re-import")
         self._refresh_leagues()
 
     def _login_failed(self, msg):
@@ -320,7 +237,7 @@ class TradeApp(tk.Tk):
 
     def _on_start_click(self):
         if not self.poesessid:
-            messagebox.showwarning("Not logged in", "Click Login first.")
+            messagebox.showwarning("Not logged in", "Click Import Cookies first.")
             return
         try:
             league, search_id = self._resolve_search(
