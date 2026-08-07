@@ -52,9 +52,12 @@ It does NOT guarantee you win the item. You can still fail because:
      (what `websockets`/`ssl` produce) gets flagged and the connection is
      closed with code 1008 shortly after it opens, even with valid cookies.
      curl_cffi can impersonate a real browser's TLS handshake.
-   - `selenium` drives the login browser window. It needs Microsoft Edge
-     installed (default on Windows) — Selenium 4.6+ auto-downloads a
-     matching `msedgedriver` on first use, no manual driver setup required.
+   - `selenium` drives the login browser window. It launches whichever
+     browser is set as your Windows default (Chrome, Firefox, or Edge),
+     falling back to Edge if detection or launch fails. Selenium 4.6+
+     auto-downloads the matching driver (`chromedriver`/`geckodriver`/
+     `msedgedriver`) on first use — no manual driver setup required, as
+     long as that browser is installed.
 
 2. Run the app:
    ```
@@ -92,7 +95,7 @@ It does NOT guarantee you win the item. You can still fail because:
   does not replay listings that appeared while offline.
 - No rate-limit header parsing (429 responses are shown but not retried).
 - Tkinter UI only; cards are not removed when listings expire.
-- Login capture relies on Selenium/Edge automation; if GGG changes its
+- Login capture relies on Selenium browser automation; if GGG changes its
   cookie names or login flow, the capture step may need updates.
 
 ## Terms of service

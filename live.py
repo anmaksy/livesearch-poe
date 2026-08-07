@@ -158,6 +158,41 @@ class TradeApp(tk.Tk):
         self.login_status.config(text="Opening browser…", foreground="orange")
         threading.Thread(target=self._do_login, daemon=True).start()
 
+    def _detect_default_browser(self):
+        """Reads Windows' registered default browser for https links."""
+        try:
+            import winreg
+            key_path = (
+                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations"
+                r"\https\UserChoice"
+            )
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                prog_id, _ = winreg.QueryValueEx(key, "ProgId")
+        except Exception:
+            return "edge"
+
+        prog_id = prog_id.lower()
+        if "chrome" in prog_id:
+            return "chrome"
+        if "firefox" in prog_id:
+            return "firefox"
+        return "edge"
+
+    def _launch_browser(self, webdriver):
+        """Launches the user's default browser, falling back to Edge."""
+        browser = self._detect_default_browser()
+        if browser == "chrome":
+            try:
+                return webdriver.Chrome()
+            except Exception:
+                pass
+        elif browser == "firefox":
+            try:
+                return webdriver.Firefox()
+            except Exception:
+                pass
+        return webdriver.Edge()
+
     def _do_login(self):
         try:
             from selenium import webdriver
@@ -174,7 +209,7 @@ class TradeApp(tk.Tk):
         cookies = {}
         ua = None
         try:
-            driver = webdriver.Edge()
+            driver = self._launch_browser(webdriver)
             driver.get("https://www.pathofexile.com/login")
 
             deadline = time.time() + LOGIN_TIMEOUT_S
