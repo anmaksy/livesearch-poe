@@ -426,7 +426,11 @@ class TradeApp(tk.Tk):
             headers = self._api_headers(json_body=True)
 
             try:
-                res = requests.post(url, json={"token": token}, headers=headers)
+                res = requests.post(
+                    url,
+                    json={"token": token, "continue": True},
+                    headers=headers,
+                )
             except Exception:
                 _set_status("❌ Request Failed", "red")
                 return
@@ -435,25 +439,6 @@ class TradeApp(tk.Tk):
                 # e.g. 404 = the listing is already gone; nothing to confirm.
                 _set_status(_error_text(res), "red")
                 return
-
-            # The site sends this token twice: once bare, which is what
-            # actually starts/completes the hideout join, then again with
-            # continue=True to confirm it when the site would show the
-            # "in demand, teleport anyway?" countdown. For an item that
-            # wasn't in demand, the join already completed on the first
-            # call, so this second call has nothing to confirm and comes
-            # back as an error (observed: 503) even though the teleport
-            # already happened — that's not a real failure, so it's not
-            # surfaced as one.
-            try:
-                requests.post(
-                    url,
-                    json={"token": token, "continue": True},
-                    headers=headers,
-                    timeout=8,
-                )
-            except Exception:
-                pass
 
             _set_status("✅ Action Sent to Client!", "green")
 
