@@ -178,20 +178,58 @@ class TradeApp(tk.Tk):
             return "firefox"
         return "edge"
 
+    # Cloudflare's challenge fingerprints the automation markers Selenium
+    # leaves behind by default (navigator.webdriver, the "enable-automation"
+    # info bar, the automation extension) and fails the check even when a
+    # human solves it manually in the window. These flags/prefs strip the
+    # obvious tells; it's not a guarantee against every Cloudflare check,
+    # but it fixes the common "stuck in an endless challenge loop" case.
+    def _harden_chromium_options(self, options):
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        return options
+
+    def _hide_webdriver_flag(self, driver):
+        try:
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": (
+                        "Object.defineProperty(navigator, 'webdriver', "
+                        "{get: () => undefined})"
+                    )
+                },
+            )
+        except Exception:
+            pass  # Firefox (no CDP) or the browser doesn't support it.
+
     def _launch_browser(self, webdriver):
         """Launches the user's default browser, falling back to Edge."""
         browser = self._detect_default_browser()
         if browser == "chrome":
             try:
-                return webdriver.Chrome()
+                from selenium.webdriver.chrome.options import Options
+                driver = webdriver.Chrome(
+                    options=self._harden_chromium_options(Options())
+                )
+                self._hide_webdriver_flag(driver)
+                return driver
             except Exception:
                 pass
         elif browser == "firefox":
             try:
-                return webdriver.Firefox()
+                from selenium.webdriver.firefox.options import Options
+                options = Options()
+                options.set_preference("dom.webdriver.enabled", False)
+                return webdriver.Firefox(options=options)
             except Exception:
                 pass
-        return webdriver.Edge()
+
+        from selenium.webdriver.edge.options import Options
+        driver = webdriver.Edge(options=self._harden_chromium_options(Options()))
+        self._hide_webdriver_flag(driver)
+        return driver
 
     def _do_login(self):
         try:
@@ -228,7 +266,11 @@ class TradeApp(tk.Tk):
                 cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
                 ua = driver.execute_script("return navigator.userAgent")
         except Exception as e:
-            self.after(0, lambda: self._login_failed(str(e)))
+            # `e` is cleared by Python at the end of this except block, but
+            # the lambda below runs later via .after() — capture the text
+            # now, not inside the closure.
+            error_text = str(e)
+            self.after(0, lambda: self._login_failed(error_text))
             return
         finally:
             if driver is not None:

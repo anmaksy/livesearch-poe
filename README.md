@@ -97,6 +97,14 @@ It does NOT guarantee you win the item. You can still fail because:
 - Tkinter UI only; cards are not removed when listings expire.
 - Login capture relies on Selenium browser automation; if GGG changes its
   cookie names or login flow, the capture step may need updates.
+- Cloudflare's challenge can detect the automated browser and loop
+  endlessly even after you solve it by hand. The app strips the common
+  automation tells (`navigator.webdriver`, the "enable-automation" info
+  bar) for Chrome/Edge, which resolves most cases, but Cloudflare's more
+  aggressive checks (Turnstile) can still flag it. If Login keeps getting
+  stuck on the challenge, try again after a minute (Cloudflare temp-bans
+  repeated failures), or log into pathofexile.com normally first in your
+  regular browser so the account itself isn't flagged.
 
 ## Terms of service
 
