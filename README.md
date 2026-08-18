@@ -110,6 +110,147 @@ It does NOT guarantee you win the item. You can still fail because:
    control interface (`winmm.dll`) — no extra dependency needed. Without
    the file, the app just uses the system bell instead.
 
+## Headless CLI (`live_cli.py`)
+
+For a VPS or any box with no display, `live_cli.py` does the same job without
+Tkinter and without `browser_cookie3`. Cookies are hardcoded in the file
+(there is no browser to read them out of on a server), and a keypress replaces
+the card button. Dependencies are just `requests` and `curl_cffi`.
+
+1. Get your cookies into the **Cookies** block at the top of `live_cli.py`.
+   Run `python export_cookies.py` on your local machine (see below) and paste
+   its output over that block, or copy the values out of DevTools by hand
+   (F12 → Application → Storage → Cookies → `https://www.pathofexile.com`).
+   Either way, `COOKIE_BROWSER` has to name the browser the cookies came from
+   — that choice picks the TLS fingerprint and User-Agent the WebSocket
+   presents, and `cf_clearance` is only valid for the browser it was issued
+   to.
+
+2. Run it with a search ID or a full trade URL:
+
+   ```
+   python live_cli.py https://www.pathofexile.com/trade/search/Standard/AbCdEf
+   python live_cli.py AbCdEf --league Standard
+   python live_cli.py --list-leagues        # current PC league names
+   ```
+
+3. Offers print as they arrive, each with a slot number:
+
+   ```
+   14:22:07  [1] Headhunter
+         💰 200 divine   👤 Exile_Trader
+         Enter = whisper  |  1 = whisper this
+   14:22:09  [2] Mageblood
+         💰 180 divine   👤 SomeGuy
+   ```
+
+   | Key | Action |
+   | --- | --- |
+   | `Enter` / `space` | whisper the newest live offer |
+   | `1`–`9` | whisper that slot (a slot can be fired again) |
+   | `l` | list live offers with their remaining time |
+   | `q` / `Ctrl+C` | quit |
+
+   The keyboard is read on the main thread and never blocks the socket, so new
+   offers keep printing while you have not pressed anything — important,
+   because a whisper token dies within seconds and a blocking prompt would
+   hold up the next listing behind the current one.
+
+4. Slots expire after 60 seconds (`--expiry SECONDS`) and are recycled, so on
+   a busy search you are never pressing keys to clear a backlog of listings
+   that are already gone. Only nine offers are addressable at once; the oldest
+   is evicted when all digits are taken.
+
+Options: `--auto` whispers every new offer on arrival with no keypress (mind
+the rate limits, and see Terms of service), `--no-bell` suppresses the
+terminal bell that rings on each new offer, `--no-color` drops ANSI colour.
+Colour is off automatically when stdout is not a terminal, and with no usable
+stdin at all (`nohup`, a detached systemd unit) the tool says so and keeps
+listening instead of exiting — combine that with `--auto` if nothing will be
+there to press keys.
+
+The reconnect behaviour and close-code reasons below apply identically; the
+CLI prints them as timestamped status lines.
+
+### Running on a minimal Linux VPS
+
+`live_cli.py` imports nothing Windows-only and nothing GUI-related at all — no
+Tkinter, no `browser_cookie3`, no audio. On a bare Debian/Ubuntu/Alpine box:
+
+```
+python3 -m pip install requests curl_cffi
+python3 live_cli.py AbCdEf --league Standard
+```
+
+- **Python 3.10+.** That floor comes from `curl_cffi`, not this script. Distros
+  still on 3.9 (Debian 11, RHEL 9) will resolve an older `curl_cffi` that
+  predates the browser TLS profiles named in `BROWSER_PROFILES`; the socket
+  then never connects. The tool checks the installed version's profile list at
+  startup and says so rather than looping. `curl_cffi` publishes musllinux
+  wheels, so Alpine works without a compiler.
+- **Locale.** With a UTF-8 locale you get the emoji; on an ASCII-only stream
+  they degrade to `[ok]`, `$`, `@`, and non-ASCII item names (PoE's
+  `Maelström Staff`) are replaced rather than raising mid-print.
+- **Piping and logging.** Colour is suppressed when stdout is not a terminal
+  or when `TERM` is `dumb`/unset, and the new-offer bell is never written into
+  a redirected log or the journal.
+- **Interactive over SSH.** Run it inside `tmux` or `screen` so the keypress
+  workflow survives a dropped connection. `Ctrl+C` quits, and so does a
+  `SIGTERM` from `systemctl stop` or `kill` — both restore the terminal's echo
+  and line editing on the way out.
+- **Unattended.** Under `nohup`, a systemd unit, or `< /dev/null` there is no
+  keyboard to read; the tool reports that once and keeps listening instead of
+  exiting. Pair it with `--auto` if nothing will be there to press keys.
+
+## Exporting cookies without DevTools (`export_cookies.py`)
+
+`export_cookies.py` reads the same cookies live.py's **Import Cookies** button
+reads and prints them as a paste-ready block. Run it on the machine whose
+browser is logged into pathofexile.com — not on the VPS, which has no browser —
+then paste the output into `live_cli.py` over SSH. It needs `browser_cookie3`
+(and nothing else).
+
+```
+$ python export_cookies.py
+# Read from Firefox on 2026-08-18 14:02
+POESESSID = "<32 chars>"            # real output prints the values in full
+CF_CLEARANCE = "<533 chars>"
+POETOKEN = "<483 chars>"
+COOKIE_BROWSER = "firefox"
+
+POESESSID: session cookie (no expiry)      # ← stderr from here down
+cf_clearance: no practical expiry
+```
+
+Only the assignments go to stdout; the expiry lines and warnings go to stderr,
+so `python export_cookies.py > cookies.txt` gives a paste-clean file. What each
+cookie's expiry reads as depends on what the browser recorded — `EXPIRED at …`
+is worth acting on, since a `cf_clearance` that has run out is the usual cause
+of a repeating 1008. Use `--mask` to see what you have without putting the
+values on screen.
+
+| Flag | Effect |
+| --- | --- |
+| `--browser NAME` | read only `firefox`/`brave`/`edge`/`chrome` instead of trying each in turn |
+| `--all` | report what every browser holds, values masked, failures included |
+| `--json` | print a JSON object instead of a paste-ready block |
+| `--mask` | hide most of each value — for checking what you have, not for pasting |
+
+`--all` is the one to run when nothing is found; it names the reason per
+browser:
+
+```
+$ python export_cookies.py --all
+firefox  ✅ POESESSID, cf_clearance, POETOKEN
+brave    ❌ Failed to decrypt the cipher text with DPAPI
+edge     — readable, but no PoE session cookies
+chrome   ❌ Unable to get key for cookie decryption
+```
+
+Those Brave and Chrome failures are App-Bound Encryption, not a bug — see
+Known limitations. Firefox is the browser this works on; for the others, fall
+back to copying from DevTools.
+
 ## GGG API requirements (must comply)
 
 - Set a descriptive User-Agent with contact info (already configured).
@@ -153,8 +294,11 @@ steady state, not a fault.
 - Reconnects automatically on disconnect (2s backoff) while running, but
   does not replay listings that appeared while offline.
 - No rate-limit header parsing (429 responses are shown but not retried).
-- Tkinter UI only. Cards clear themselves 3 minutes after they appear;
-  there is no history of what scrolled past.
+- Two frontends: the Tkinter UI (`live.py`) and the headless CLI
+  (`live_cli.py`). Cards clear themselves 3 minutes after they appear (CLI
+  slots after 60 seconds), and neither keeps a history of what scrolled past.
+- The CLI addresses at most 9 offers at a time (digits `1`-`9`) and reads
+  cookies only from the hardcoded values at the top of the file.
 - **Import Cookies requires you to already be logged into pathofexile.com**
   in Firefox, Brave, Edge, or Chrome — it reads existing cookies, it doesn't
   log you in.
