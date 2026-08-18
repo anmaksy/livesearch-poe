@@ -55,8 +55,11 @@ It does NOT guarantee you win the item. You can still fail because:
      closed with code 1008 shortly after it opens, even with valid cookies.
      curl_cffi can impersonate a real browser's TLS handshake.
    - `browser_cookie3` reads cookies directly out of your installed
-     browsers' cookie storage (Firefox, then Edge, then Chrome, in that
-     order). An earlier version of this tool automated a browser with
+     browsers' cookie storage (Firefox, then Brave, then Edge, then Chrome,
+     in that order). Whichever browser supplies the cookies also decides the
+     TLS fingerprint and User-Agent used for the WebSocket, because a
+     `cf_clearance` cookie is only valid for the browser it was issued to.
+     An earlier version of this tool automated a browser with
      Selenium to log in, but Cloudflare's challenge detects the WebDriver
      protocol itself (Firefox even shows a "Browser is under remote
      control" banner) and fails the check regardless of language/framework
@@ -75,6 +78,13 @@ It does NOT guarantee you win the item. You can still fail because:
 4. Click **Import Cookies**. The app reads `POESESSID`, `cf_clearance`, and
    `POETOKEN` from your browser's cookie store for `pathofexile.com`. Never
    share these values; they grant full account access.
+
+   On Brave, Chrome or Edge this will usually fail — see App-Bound
+   Encryption under Known limitations. Use **Paste Cookies…** instead: open
+   `pathofexile.com` in that browser, press F12 → Application → Storage →
+   Cookies → `https://www.pathofexile.com`, and copy `POESESSID` and
+   `cf_clearance` into the dialog. Pick the browser you copied from in the
+   dropdown so the WebSocket presents that browser's fingerprint.
 
 5. Pick your league from the dropdown (auto-populated from GGG's API), and
    paste a search ID or a full trade URL (e.g.
@@ -99,6 +109,37 @@ It does NOT guarantee you win the item. You can still fail because:
 - Respect rate limits; do not auto-spam whispers in a loop.
 - Manual button click per item is intentional and safer for your account.
 
+## The "Reconnecting…" status
+
+The live-search socket is not a permanent connection, so seeing
+**Reconnecting…** is normal — it only matters how often, and why. The status
+now names the reason, taken from the WebSocket close code:
+
+| Status | Close code | What it means |
+| --- | --- | --- |
+| `Reconnecting… (idle timeout)` | 1000 | GGG closed an idle socket cleanly. Routine — expect it every few minutes on a quiet search. The app reconnects after 2s and carries on. |
+| `Reconnecting… (dropped)` | 1006 | Connection died without a close frame — usually your own network (Wi-Fi drop, VPN, sleep/resume). Recovers by itself. |
+| `Reconnecting… (rejected — re-import cookies)` | 1008 | Cloudflare or GGG rejected the handshake. This one does **not** heal: it will loop every 2s forever. |
+| `Reconnecting… (server error / restart / try again later)` | 1011/1012/1013 | GGG's side. Wait it out. |
+| `Reconnecting… (ConnectionError, …)` | — | The connection attempt itself failed; the exception name is shown. |
+
+A repeating **1008** means one of:
+
+- `POESESSID` expired, or you logged out / logged in elsewhere. Re-import.
+- `cf_clearance` no longer matches this client. Cloudflare binds that cookie
+  to the User-Agent it was issued under and to the browser's TLS
+  fingerprint (JA3/JA4), so cookies taken from one browser and replayed with
+  another browser's fingerprint get thrown out. This is why the app now picks
+  its impersonation target from whichever browser the cookies came from, and
+  why the Paste Cookies dialog asks which browser you copied from.
+- Your IP changed since the clearance was issued (VPN toggled, ISP re-lease).
+- The `cf_clearance` cookie simply expired — they are short-lived. Reload
+  pathofexile.com in the browser, then re-import.
+
+Note that a search with no new listings looks identical to a working one, so
+`⚡ Connected (Listening)` alternating with `(idle timeout)` is the healthy
+steady state, not a fault.
+
 ## Known limitations
 
 - Fetch endpoint accepts at most 10 item IDs per request (handled below).
@@ -107,13 +148,17 @@ It does NOT guarantee you win the item. You can still fail because:
 - No rate-limit header parsing (429 responses are shown but not retried).
 - Tkinter UI only; cards are not removed when listings expire.
 - **Import Cookies requires you to already be logged into pathofexile.com**
-  in Firefox, Edge, or Chrome — it reads existing cookies, it doesn't log
-  you in.
-- **Firefox is the most reliable source.** Chrome and Edge (Chromium 127+)
-  ship "App-Bound Encryption," which ties cookie decryption to the browser
-  binary itself and blocks most third-party cookie readers, including
-  `browser_cookie3`. If Import Cookies fails on Chrome/Edge, log into
-  pathofexile.com in Firefox instead and re-import.
+  in Firefox, Brave, Edge, or Chrome — it reads existing cookies, it doesn't
+  log you in.
+- **Firefox is the only browser Import Cookies reliably works on.** Brave,
+  Chrome and Edge are all Chromium 127+, which ships "App-Bound Encryption":
+  cookies are stored with a `v20` prefix and their key is held by the
+  browser's own elevation service, so no third-party reader —
+  `browser_cookie3` included — can decrypt them. The Brave loader is wired
+  up and will work if that ever changes (or on an older profile whose
+  cookies are still `v10`), but today it fails with a DPAPI decrypt error.
+  For those browsers use **Paste Cookies…**, or log into pathofexile.com in
+  Firefox and re-import.
 - Cookie-format/DB-schema changes in a future browser version could break
   `browser_cookie3`'s extraction.
 
