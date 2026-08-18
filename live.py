@@ -457,6 +457,15 @@ class TradeApp(tk.Tk):
 
     NEW_INDICATOR_TIMEOUT_MS = 15_000
     NEW_INDICATOR_BLINK_MS = 500
+    # Whisper tokens expire within seconds, so a card older than this is only
+    # clutter — drop it rather than let the list grow all session.
+    CARD_EXPIRY_MS = 180_000
+
+    SEND_TEXT = "💬 Send Whisper / Travel to Hideout"
+    # The button is never disabled — a token that looks missing or spent can
+    # still work, so it stays clickable and is only marked. See send_whisper_action.
+    SEND_TEXT_NO_TOKEN = "⚠ Send Whisper / Travel to Hideout"
+    SEND_TEXT_RETRY = "↻ Send Again / Travel to Hideout"
 
     def _create_card_widget(self, item):
         """Renders an item card with a manual action button."""
@@ -494,6 +503,13 @@ class TradeApp(tk.Tk):
         blink_state["job"] = self.after(self.NEW_INDICATOR_BLINK_MS, _blink)
         self.after(self.NEW_INDICATOR_TIMEOUT_MS, _stop_blink)
 
+        def _expire():
+            _stop_blink()
+            if card.winfo_exists():
+                card.destroy()
+
+        self.after(self.CARD_EXPIRY_MS, _expire)
+
         details = f"💰 Price: {item['price']}  |  👤 Seller: {item['seller']}"
         ttk.Label(card, text=details).pack(anchor="w", pady=2)
 
@@ -505,24 +521,26 @@ class TradeApp(tk.Tk):
             self.send_whisper_action(item["token"], action_btn, action_status)
 
         # Manual Action Button
-        action_btn = ttk.Button(
-            card,
-            text="💬 Send Whisper / Travel to Hideout",
-            command=_on_send_click,
-        )
+        action_btn = ttk.Button(card, text=self.SEND_TEXT, command=_on_send_click)
 
         if not item["token"]:
-            action_btn.config(state=tk.DISABLED)
+            # Marked, not disabled: the fetch response occasionally omits the
+            # token even though the listing is live, so let the user try.
+            action_btn.config(text=self.SEND_TEXT_NO_TOKEN)
             action_status.config(
-                text="❌ Missing whisper token", foreground="red"
+                text="⚠ No whisper token — will likely fail", foreground="orange"
             )
 
         action_btn.pack(side=tk.LEFT, pady=5)
         action_status.pack(side=tk.LEFT, padx=10)
 
     def send_whisper_action(self, token, button, status_label):
-        """Sends the POST /api/trade/whisper request when user clicks button."""
-        button.config(state=tk.DISABLED)
+        """Sends the POST /api/trade/whisper request when user clicks button.
+
+        The button deliberately stays enabled: a whisper can fail for reasons
+        that clear up on a retry (token race, transient 5xx, rate limit), so
+        it's only relabelled to show it has already been fired once.
+        """
         status_label.config(text="Sending request...", foreground="blue")
 
         def _error_text(res):
@@ -535,7 +553,15 @@ class TradeApp(tk.Tk):
             return f"❌ Error {res.status_code}: {message}"
 
         def _set_status(text, color):
-            self.after(0, lambda: status_label.config(text=text, foreground=color))
+            # Cards are removed after CARD_EXPIRY_MS, so the widgets may be
+            # gone by the time a slow request comes back.
+            def _apply():
+                if status_label.winfo_exists():
+                    status_label.config(text=text, foreground=color)
+                if button.winfo_exists():
+                    button.config(text=self.SEND_TEXT_RETRY)
+
+            self.after(0, _apply)
 
         def _post():
             url = "https://www.pathofexile.com/api/trade/whisper"

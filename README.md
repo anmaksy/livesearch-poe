@@ -26,7 +26,14 @@ clicking through the browser UI.
    hideout command: `POST /api/trade/whisper` with `{"token": "<whisper_token>"}`.
    A 200 response means GGG accepted the action; the in-game client should
    receive the whisper or hideout invite shortly after.
-7. Click **Stop** at any time to disconnect the live search.
+
+   The button is never greyed out, only relabelled — `↻ Send Again` once it
+   has been fired, `⚠` if the listing arrived without a whisper token — so a
+   send that failed for a reason that may clear up (token race, transient
+   5xx, rate limit) can always be retried. Mind the rate limits when you do.
+7. Cards disappear 3 minutes after they appear, since a whisper token is
+   only good for seconds and stale cards are just clutter.
+8. Click **Stop** at any time to disconnect the live search.
 
 ## Does the "in demand" bypass work?
 
@@ -146,7 +153,8 @@ steady state, not a fault.
 - Reconnects automatically on disconnect (2s backoff) while running, but
   does not replay listings that appeared while offline.
 - No rate-limit header parsing (429 responses are shown but not retried).
-- Tkinter UI only; cards are not removed when listings expire.
+- Tkinter UI only. Cards clear themselves 3 minutes after they appear;
+  there is no history of what scrolled past.
 - **Import Cookies requires you to already be logged into pathofexile.com**
   in Firefox, Brave, Edge, or Chrome — it reads existing cookies, it doesn't
   log you in.
