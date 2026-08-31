@@ -20,10 +20,21 @@ if sys.stderr is None:
 
 # GGG API policy requires setting an identifiable User-Agent
 USER_AGENT = "PoeLiveSearchApp/1.0 (contact: guspisia@gmail.com)"
-# Fallback WS User-Agent, overwritten with the real one captured at login.
-DEFAULT_WS_USER_AGENT = (
+
+# The WebSocket handshake has to look like it came from the same browser the
+# cookies were imported from: Cloudflare binds a cf_clearance cookie to the
+# User-Agent string it was issued under *and*, via JA3/JA4, to that browser's
+# TLS handshake. Import from Brave but connect as Firefox and the clearance is
+# rejected — the socket opens and is then closed with 1008.
+FIREFOX_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
 )
+CHROMIUM_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+)
+DEFAULT_WS_USER_AGENT = FIREFOX_UA
+DEFAULT_WS_IMPERSONATE = "firefox135"
 LEAGUES_URL = "https://www.pathofexile.com/api/trade/data/leagues"
 DEFAULT_LEAGUES = ["Standard", "Hardcore"]
 ALERT_SOUND_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert.mp3")
@@ -49,7 +60,9 @@ class TradeApp(tk.Tk):
         self.poesessid = None
         self.cf_clearance = None
         self.poetoken = None
+        self.cookie_browser = None
         self.ws_user_agent = DEFAULT_WS_USER_AGENT
+        self.ws_impersonate = DEFAULT_WS_IMPERSONATE
 
         self.league = None
         self.search_id = None
@@ -70,6 +83,11 @@ class TradeApp(tk.Tk):
             login_row, text="Import Cookies", command=self._on_login_click
         )
         self.login_btn.pack(side=tk.LEFT)
+
+        self.paste_btn = ttk.Button(
+            login_row, text="Paste Cookies…", command=self._on_paste_click
+        )
+        self.paste_btn.pack(side=tk.LEFT, padx=(5, 0))
 
         self.login_status = ttk.Label(
             login_row, text="No session imported", foreground="red"
@@ -176,10 +194,21 @@ class TradeApp(tk.Tk):
     # No amount of flag-hiding reliably beats that. Instead, this reads the
     # session cookies straight out of your existing, already-logged-in
     # browser's cookie storage — no automation involved, so there's nothing
-    # for Cloudflare to detect. Firefox is tried first because the WS
-    # connection below impersonates Firefox's TLS fingerprint, and
-    # cf_clearance can be tied to the browser it was issued to.
-    COOKIE_BROWSER_ORDER = ("firefox", "edge", "chrome")
+    # for Cloudflare to detect. Firefox is tried first because it's the only
+    # one without App-Bound Encryption, so its cookie store is the one that
+    # reliably decrypts; whichever browser does supply the cookies also
+    # decides the TLS fingerprint and User-Agent used for the WebSocket.
+    #
+    # (loader name, curl_cffi impersonate target, WebSocket User-Agent)
+    COOKIE_BROWSERS = (
+        ("firefox", DEFAULT_WS_IMPERSONATE, FIREFOX_UA),
+        # Brave deliberately reports Chrome's exact User-Agent — no "Brave"
+        # token, and the minor version frozen at 0.0.0 — so plain Chrome is
+        # the correct profile to impersonate for it, not a Brave-specific one.
+        ("brave", "chrome146", CHROMIUM_UA),
+        ("edge", "chrome146", f"{CHROMIUM_UA} Edg/146.0.0.0"),
+        ("chrome", "chrome146", CHROMIUM_UA),
+    )
 
     def _on_login_click(self):
         self.login_btn.config(state=tk.DISABLED)
@@ -198,27 +227,30 @@ class TradeApp(tk.Tk):
             )
             return
 
-        loaders = {
-            "firefox": browser_cookie3.firefox,
-            "edge": browser_cookie3.edge,
-            "chrome": browser_cookie3.chrome,
-        }
-
         cookies = {}
+        source = None
         last_error = ""
-        for name in self.COOKIE_BROWSER_ORDER:
+        for name, impersonate, user_agent in self.COOKIE_BROWSERS:
+            loader = getattr(browser_cookie3, name, None)
+            if loader is None:
+                # Older browser_cookie3 releases predate some of these.
+                continue
             try:
-                jar = loaders[name](domain_name="pathofexile.com")
+                jar = loader(domain_name="pathofexile.com")
                 found = {c.name: c.value for c in jar}
             except Exception as e:
                 last_error = str(e)
                 continue
             if "POESESSID" in found:
                 cookies = found
+                source = (name, impersonate, user_agent)
                 break
 
-        if "POESESSID" not in cookies:
-            msg = "No PoE session found. Log into pathofexile.com in Firefox/Edge/Chrome first."
+        if source is None:
+            msg = (
+                "No readable session found — log into pathofexile.com in "
+                "Firefox, or use Paste Cookies."
+            )
             if last_error:
                 msg += f" ({last_error[:60]})"
             self.after(0, lambda: self._login_failed(msg))
@@ -227,13 +259,97 @@ class TradeApp(tk.Tk):
         self.poesessid = cookies["POESESSID"]
         self.cf_clearance = cookies.get("cf_clearance", "")
         self.poetoken = cookies.get("POETOKEN", "")
+        self.cookie_browser, self.ws_impersonate, self.ws_user_agent = source
 
         self.after(0, self._login_success)
 
-    def _login_success(self):
-        self.login_status.config(text="✅ Cookies imported", foreground="green")
+    def _login_success(self, verb="imported from"):
+        self.login_status.config(
+            text=f"✅ Cookies {verb} {self.cookie_browser.capitalize()}",
+            foreground="green",
+        )
         self.login_btn.config(state=tk.NORMAL, text="Re-import")
         self._refresh_leagues()
+
+    # ------------------------------------------------------ Manual cookies --
+
+    # Chromium 127+ ships App-Bound Encryption: cookies are stored with a
+    # "v20" prefix under a key held by the browser's own elevation service,
+    # so no third-party reader — browser_cookie3 included — can decrypt them.
+    # Brave, Chrome and Edge are all affected, which leaves Firefox as the
+    # only browser Import Cookies works on. For the others, copy the values
+    # out of DevTools (F12 → Application → Storage → Cookies →
+    # https://www.pathofexile.com) and paste them here instead.
+    def _on_paste_click(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Paste session cookies")
+        dlg.transient(self)
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+
+        body = ttk.Frame(dlg, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            body,
+            text="DevTools (F12) → Application → Cookies → pathofexile.com",
+            font=("Arial", 9, "italic"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ttk.Label(body, text="Copied from:").grid(row=1, column=0, sticky="w")
+        browser_var = tk.StringVar(value="brave")
+        ttk.Combobox(
+            body,
+            textvariable=browser_var,
+            values=[name for name, _, _ in self.COOKIE_BROWSERS],
+            state="readonly",
+            width=38,
+        ).grid(row=1, column=1, sticky="we", pady=2)
+
+        entries = {}
+        rows = (
+            ("POESESSID", "POESESSID (required)"),
+            ("cf_clearance", "cf_clearance"),
+            ("POETOKEN", "POETOKEN (optional)"),
+        )
+        for offset, (key, label) in enumerate(rows, start=2):
+            ttk.Label(body, text=f"{label}:").grid(row=offset, column=0, sticky="w")
+            var = tk.StringVar()
+            ttk.Entry(body, textvariable=var, width=40).grid(
+                row=offset, column=1, sticky="we", pady=2
+            )
+            entries[key] = var
+
+        error = ttk.Label(body, text="", foreground="red")
+        error.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        def _save():
+            poesessid = entries["POESESSID"].get().strip()
+            if not poesessid:
+                error.config(text="POESESSID is required.")
+                return
+            name = browser_var.get()
+            profile = next(
+                (p for p in self.COOKIE_BROWSERS if p[0] == name),
+                self.COOKIE_BROWSERS[0],
+            )
+            self.poesessid = poesessid
+            self.cf_clearance = entries["cf_clearance"].get().strip()
+            self.poetoken = entries["POETOKEN"].get().strip()
+            self.cookie_browser, self.ws_impersonate, self.ws_user_agent = profile
+            dlg.destroy()
+            self._login_success(verb="pasted from")
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Use these", command=_save).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+        dlg.bind("<Return>", lambda _e: _save())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
 
     def _login_failed(self, msg):
         self.login_status.config(text=f"❌ {msg[:80]}", foreground="red")
@@ -341,6 +457,15 @@ class TradeApp(tk.Tk):
 
     NEW_INDICATOR_TIMEOUT_MS = 15_000
     NEW_INDICATOR_BLINK_MS = 500
+    # Whisper tokens expire within seconds, so a card older than this is only
+    # clutter — drop it rather than let the list grow all session.
+    CARD_EXPIRY_MS = 180_000
+
+    SEND_TEXT = "💬 Send Whisper / Travel to Hideout"
+    # The button is never disabled — a token that looks missing or spent can
+    # still work, so it stays clickable and is only marked. See send_whisper_action.
+    SEND_TEXT_NO_TOKEN = "⚠ Send Whisper / Travel to Hideout"
+    SEND_TEXT_RETRY = "↻ Send Again / Travel to Hideout"
 
     def _create_card_widget(self, item):
         """Renders an item card with a manual action button."""
@@ -378,6 +503,13 @@ class TradeApp(tk.Tk):
         blink_state["job"] = self.after(self.NEW_INDICATOR_BLINK_MS, _blink)
         self.after(self.NEW_INDICATOR_TIMEOUT_MS, _stop_blink)
 
+        def _expire():
+            _stop_blink()
+            if card.winfo_exists():
+                card.destroy()
+
+        self.after(self.CARD_EXPIRY_MS, _expire)
+
         details = f"💰 Price: {item['price']}  |  👤 Seller: {item['seller']}"
         ttk.Label(card, text=details).pack(anchor="w", pady=2)
 
@@ -389,24 +521,26 @@ class TradeApp(tk.Tk):
             self.send_whisper_action(item["token"], action_btn, action_status)
 
         # Manual Action Button
-        action_btn = ttk.Button(
-            card,
-            text="💬 Send Whisper / Travel to Hideout",
-            command=_on_send_click,
-        )
+        action_btn = ttk.Button(card, text=self.SEND_TEXT, command=_on_send_click)
 
         if not item["token"]:
-            action_btn.config(state=tk.DISABLED)
+            # Marked, not disabled: the fetch response occasionally omits the
+            # token even though the listing is live, so let the user try.
+            action_btn.config(text=self.SEND_TEXT_NO_TOKEN)
             action_status.config(
-                text="❌ Missing whisper token", foreground="red"
+                text="⚠ No whisper token — will likely fail", foreground="orange"
             )
 
         action_btn.pack(side=tk.LEFT, pady=5)
         action_status.pack(side=tk.LEFT, padx=10)
 
     def send_whisper_action(self, token, button, status_label):
-        """Sends the POST /api/trade/whisper request when user clicks button."""
-        button.config(state=tk.DISABLED)
+        """Sends the POST /api/trade/whisper request when user clicks button.
+
+        The button deliberately stays enabled: a whisper can fail for reasons
+        that clear up on a retry (token race, transient 5xx, rate limit), so
+        it's only relabelled to show it has already been fired once.
+        """
         status_label.config(text="Sending request...", foreground="blue")
 
         def _error_text(res):
@@ -419,7 +553,15 @@ class TradeApp(tk.Tk):
             return f"❌ Error {res.status_code}: {message}"
 
         def _set_status(text, color):
-            self.after(0, lambda: status_label.config(text=text, foreground=color))
+            # Cards are removed after CARD_EXPIRY_MS, so the widgets may be
+            # gone by the time a slow request comes back.
+            def _apply():
+                if status_label.winfo_exists():
+                    status_label.config(text=text, foreground=color)
+                if button.winfo_exists():
+                    button.config(text=self.SEND_TEXT_RETRY)
+
+            self.after(0, _apply)
 
         def _post():
             url = "https://www.pathofexile.com/api/trade/whisper"
@@ -453,7 +595,8 @@ class TradeApp(tk.Tk):
         # and are a bot-detection tripwire). This route is proxied through
         # Cloudflare, which fingerprints the TLS handshake itself — plain
         # Python ssl gets closed with 1008 regardless of cookies, so this
-        # uses curl_cffi's Firefox impersonation instead of `websockets`.
+        # uses curl_cffi's impersonation of the cookie browser (see
+        # COOKIE_BROWSERS) instead of the `websockets` package.
         cookie_parts = [f"POESESSID={self.poesessid}"]
         if self.cf_clearance:
             cookie_parts.append(f"cf_clearance={self.cf_clearance}")
@@ -469,25 +612,22 @@ class TradeApp(tk.Tk):
         WS_CLOSE_OPCODE = 8
 
         while self.is_running:
+            reason = ""
+            session = None
             try:
-                session = cffi_requests.Session(impersonate="firefox135")
+                session = cffi_requests.Session(impersonate=self.ws_impersonate)
                 ws = session.ws_connect(ws_url, headers=headers)
                 self.current_ws = ws
 
-                self.after(
-                    0,
-                    lambda: self.status_label.config(
-                        text="⚡ Connected (Listening)", foreground="green"
-                    ),
-                )
+                self._set_ws_status("⚡ Connected (Listening)", "green")
 
                 while self.is_running:
                     msg, opcode = ws.recv()
 
                     if opcode == WS_CLOSE_OPCODE:
-                        # Server closed the connection (e.g. normal 1000
-                        # closure after some idle period) — msg here is a
-                        # raw 2-byte close code, not JSON. Reconnect.
+                        # Server closed the connection — msg here is a raw
+                        # 2-byte close code, not JSON. Reconnect.
+                        reason = self._close_reason(ws.close_code)
                         break
 
                     data = json.loads(msg)
@@ -502,19 +642,47 @@ class TradeApp(tk.Tk):
             except Exception as e:
                 if self.is_running:
                     print(f"WebSocket error: {e!r}")
+                    # Acking a close frame can itself fail if the peer is
+                    # already gone; the code it sent is still the useful part.
+                    code = getattr(self.current_ws, "close_code", None)
+                    reason = self._close_reason(code) or type(e).__name__
             finally:
                 self.current_ws = None
+                if session is not None:
+                    # Not closing this leaks a libcurl handle per reconnect.
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
 
             if not self.is_running:
                 break
 
-            self.after(
-                0,
-                lambda: self.status_label.config(
-                    text="Reconnecting...", foreground="orange"
-                ),
-            )
+            # The reason matters: an idle 1000 is routine, whereas a repeating
+            # 1008 means the cookies/fingerprint were rejected and reconnecting
+            # will never fix itself. Without it every failure looks identical.
+            text = "Reconnecting..." if not reason else f"Reconnecting… ({reason})"
+            self._set_ws_status(text, "orange")
             time.sleep(2)
+
+    # WebSocket close codes worth naming; anything else is shown as-is.
+    CLOSE_REASONS = {
+        1000: "idle timeout",
+        1001: "server going away",
+        1006: "dropped",
+        1008: "rejected — re-import cookies",
+        1011: "server error",
+        1012: "server restart",
+        1013: "try again later",
+    }
+
+    def _close_reason(self, code):
+        if code is None:
+            return ""
+        return self.CLOSE_REASONS.get(code, f"closed {code}")
+
+    def _set_ws_status(self, text, color):
+        self.after(0, lambda: self.status_label.config(text=text, foreground=color))
 
     def _fetch_items(self, result_token):
         """Retrieves item metadata and whisper token from GGG API.
