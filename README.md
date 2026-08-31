@@ -14,9 +14,15 @@ clicking through the browser UI.
    session cookies straight out of your already-logged-in browser — no
    copy-pasting from DevTools, and no separate browser window to log into.
 2. Pick a league and paste a search ID (or a full trade URL) into the app,
-   then click **Start**.
-3. The app connects to the live-search WebSocket for that query:
+   optionally give it a short **Name**, then click **+ Add**. Repeat for as
+   many searches as you want to watch — up to 20 — then click
+   **Start All**.
+3. The app opens one live-search WebSocket per search:
    `wss://www.pathofexile.com/api/trade/live/{league}/{search_id}`
+   There is no way to multiplex several searches over one socket, so each
+   search gets its own connection, its own thread and its own status row.
+   Each search can name its own league, so a full trade URL from one league
+   sits happily in the list next to a bare search ID from another.
 4. When new listings appear, GGG pushes a token over the socket, the app
    plays `alert.mp3` (if present next to `live.py`; otherwise it falls back
    to the system bell), and a card appears in the list.
@@ -33,7 +39,47 @@ clicking through the browser UI.
    5xx, rate limit) can always be retried. Mind the rate limits when you do.
 7. Cards disappear 3 minutes after they appear, since a whisper token is
    only good for seconds and stale cards are just clutter.
-8. Click **Stop** at any time to disconnect the live search.
+8. Click **Stop All** at any time to disconnect every live search, or click
+   a row's **✕** to drop just that one. Adding a search while the others
+   are running connects it immediately — you never have to stop and
+   restart the rest to pick up a new one.
+
+## Watching several searches at once
+
+The **Searches** panel is the list of what the app is subscribed to. Each row
+shows a status dot, the search's name and `league/search_id`, its own
+connection status, and a **✕** to remove it:
+
+```
+League:[Standard v]  Name:[chest]  Search ID / URL:[AbCdEf]  [+ Add]
+┌ Searches ──────────────────────────────────────┐
+│ ● chest — Standard/AbCdEf    connected       ✕ │
+│ ● Hardcore/QqWw88            reconnecting…   ✕ │
+│ ● ring — Standard/XyZ123     rejected        ✕ │
+└────────────────────────────────────────────────┘
+  [▶ Start All]  [■ Stop All]              ⚡ 2/3 connected
+```
+
+- **Dot colour**: grey = stopped, orange = connecting or reconnecting,
+  green = connected, red = rejected (close code 1008 — see
+  "The Reconnecting… status" below).
+- **Name** is optional and cosmetic. Every item card is titled
+  `[name] Item Name` so you can tell at a glance which search produced it;
+  leave the name blank and the card is tagged with the search ID instead.
+- The aggregate on the right (`⚡ 2/3 connected`) is green only when every
+  search is connected, and red as soon as one is rejected. Because each row
+  reports separately, a single red row against green ones tells you the
+  problem is that search, not your session.
+- Duplicates (same league *and* search ID) are refused; the same search ID
+  under two different leagues is fine.
+- **20 searches is the cap.** That ceiling is this tool's, not a documented
+  GGG limit: every search fetches independently the moment a listing lands,
+  and the fetch and whisper endpoints are rate-limited per account, so a
+  wall of searches is what earns you a 429.
+
+All searches share the one set of imported cookies, so re-importing fixes
+every row at once — but note the reverse too: an expired `cf_clearance`
+takes down all of them together.
 
 ## Does the "in demand" bypass work?
 
@@ -100,7 +146,15 @@ It does NOT guarantee you win the item. You can still fail because:
    Search" there once to register interest — this tool replaces keeping
    that browser tab open.
 
-6. Click **Start** to connect. Click **Stop** to disconnect at any time.
+   Optionally type a short **Name** ("chest", "ring") to label that search,
+   then click **+ Add** — or just press Enter in either field. Add as many
+   searches as you want to watch, up to 20; see "Watching several searches at
+   once". A full trade URL carries its own league, so the dropdown is only
+   used for bare search IDs.
+
+6. Click **Start All** to connect every search in the list. **Stop All**
+   disconnects them all; a row's **✕** removes just that one, and a search
+   added while the rest are running connects straight away.
 
 7. Keep Path of Exile running and logged in on the same account whose
    cookies you imported.
@@ -260,8 +314,8 @@ back to copying from DevTools.
 ## The "Reconnecting…" status
 
 The live-search socket is not a permanent connection, so seeing
-**Reconnecting…** is normal — it only matters how often, and why. The status
-now names the reason, taken from the WebSocket close code:
+**reconnecting…** is normal — it only matters how often, and why. Each
+search's row names its own reason, taken from that socket's close code:
 
 | Status | Close code | What it means |
 | --- | --- | --- |
@@ -285,8 +339,11 @@ A repeating **1008** means one of:
   pathofexile.com in the browser, then re-import.
 
 Note that a search with no new listings looks identical to a working one, so
-`⚡ Connected (Listening)` alternating with `(idle timeout)` is the healthy
-steady state, not a fault.
+a row alternating between `connected` and `reconnecting — idle timeout` is
+the healthy steady state, not a fault. With several searches running they
+reconnect independently, so the rows will rarely all be green at the same
+instant — `⚡ 2/3 connected` flickering is normal; a row *stuck* on
+`rejected` is not.
 
 ## Known limitations
 
@@ -297,6 +354,17 @@ steady state, not a fault.
 - Two frontends: the Tkinter UI (`live.py`) and the headless CLI
   (`live_cli.py`). Cards clear themselves 3 minutes after they appear (CLI
   slots after 60 seconds), and neither keeps a history of what scrolled past.
+- **Multiple searches are a GUI feature only.** `live_cli.py` still takes
+  exactly one search per process; run one process per search on a VPS.
+- The GUI caps the list at 20 searches, and opens a separate WebSocket per
+  search — there is no multiplexing to be had, so 20 searches means 20
+  sockets and 20 independent fetches whenever listings land. The item card
+  list is shared and unsorted across searches; each card is tagged with its
+  search, but there is no per-search filtering or view.
+- The searches list is not saved between runs — relaunching the app means
+  re-adding them.
+- A search cannot be paused individually, only removed and re-added; **Start
+  All** / **Stop All** act on the whole list.
 - The CLI addresses at most 9 offers at a time (digits `1`-`9`) and reads
   cookies only from the hardcoded values at the top of the file.
 - **Import Cookies requires you to already be logged into pathofexile.com**

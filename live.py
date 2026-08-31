@@ -48,12 +48,62 @@ def parse_trade_url(text: str):
     return match.group(1), match.group(2)
 
 
+# One socket per search, so this also bounds concurrent fetches and alert
+# noise. The ceiling is ours, not a documented GGG limit: every search fetches
+# independently the moment a listing arrives, and the fetch/whisper endpoints
+# are rate-limited per account, so a wall of searches is what draws a 429.
+MAX_SEARCHES = 20
+
+
+class Search:
+    """One live-search subscription: its own socket, thread and status row.
+
+    GGG's live route is keyed by /{league}/{search_id} and there is no way to
+    multiplex several searches over one socket, so N searches means N sockets.
+    Each carries its own `is_running` rather than sharing the app's — that is
+    what lets a single row be removed, or a new one added and connected, while
+    every other search keeps listening.
+    """
+
+    __slots__ = (
+        "league", "search_id", "name", "state",
+        "is_running", "thread", "ws",
+        "row", "dot", "status_label",
+    )
+
+    def __init__(self, league, search_id, name=""):
+        self.league = league
+        self.search_id = search_id
+        self.name = name
+        self.state = "stopped"
+
+        self.is_running = False
+        self.thread = None
+        self.ws = None
+
+        # Row widgets; filled in by TradeApp._add_search_row and set back to
+        # None when the row is removed, so a late status update from this
+        # search's thread has something to test.
+        self.row = None
+        self.dot = None
+        self.status_label = None
+
+    @property
+    def label(self):
+        """Short tag stamped on every item card this search produces."""
+        return self.name or self.search_id
+
+    @property
+    def target(self):
+        return f"{self.league}/{self.search_id}"
+
+
 class TradeApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
         self.title("PoE Live Search - On-Demand Whisper Tool")
-        self.geometry("700x650")
+        self.geometry("760x760")
         self.attributes("-topmost", True)
 
         # Populated by the Login flow; required before Start will connect.
@@ -64,11 +114,11 @@ class TradeApp(tk.Tk):
         self.ws_user_agent = DEFAULT_WS_USER_AGENT
         self.ws_impersonate = DEFAULT_WS_IMPERSONATE
 
-        self.league = None
-        self.search_id = None
+        # One Search per row in the list panel, each owning a socket thread.
+        # `is_running` here means "Start All has been pressed" — it decides
+        # whether a search added afterwards connects straight away.
+        self.searches = []
         self.is_running = False
-        self.ws_thread = None
-        self.current_ws = None
 
         self._setup_ui()
         self._refresh_leagues()
@@ -94,44 +144,93 @@ class TradeApp(tk.Tk):
         )
         self.login_status.pack(side=tk.LEFT, padx=10)
 
-        connect_row = ttk.Frame(self, padding=10)
+        connect_row = ttk.Frame(self, padding=(10, 10, 10, 0))
         connect_row.pack(fill=tk.X)
 
         ttk.Label(connect_row, text="League:").pack(side=tk.LEFT)
         self.league_var = tk.StringVar()
         self.league_combo = ttk.Combobox(
             connect_row, textvariable=self.league_var, values=DEFAULT_LEAGUES,
-            width=16, state="normal",
+            width=14, state="normal",
         )
-        self.league_combo.pack(side=tk.LEFT, padx=(5, 15))
+        self.league_combo.pack(side=tk.LEFT, padx=(5, 12))
+
+        # Optional: a name is only a display label. Left blank, cards fall back
+        # to tagging with the search ID (see Search.label).
+        ttk.Label(connect_row, text="Name:").pack(side=tk.LEFT)
+        self.name_var = tk.StringVar()
+        self.name_entry = ttk.Entry(connect_row, textvariable=self.name_var, width=12)
+        self.name_entry.pack(side=tk.LEFT, padx=(5, 12))
 
         ttk.Label(connect_row, text="Search ID / URL:").pack(side=tk.LEFT)
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(
-            connect_row, textvariable=self.search_var, width=24
+            connect_row, textvariable=self.search_var, width=20
         )
-        self.search_entry.pack(side=tk.LEFT, padx=(5, 15), fill=tk.X, expand=True)
+        self.search_entry.pack(side=tk.LEFT, padx=(5, 8), fill=tk.X, expand=True)
+
+        self.add_btn = ttk.Button(
+            connect_row, text="+ Add", command=self._on_add_click
+        )
+        self.add_btn.pack(side=tk.LEFT)
+        # Enter in either field adds, so paste-and-go never needs the mouse.
+        self.search_entry.bind("<Return>", lambda _e: self._on_add_click())
+        self.name_entry.bind("<Return>", lambda _e: self._on_add_click())
+
+        # The list scrolls inside a fixed height: at MAX_SEARCHES rows an
+        # unbounded frame would push the item cards off the window.
+        list_frame = ttk.LabelFrame(self, text="Searches", padding=(6, 4))
+        list_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
+
+        self.search_canvas = tk.Canvas(
+            list_frame, height=self.SEARCH_LIST_HEIGHT, highlightthickness=0
+        )
+        search_scroll = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.search_canvas.yview
+        )
+        self.search_list = ttk.Frame(self.search_canvas)
+        self.search_list.bind(
+            "<Configure>",
+            lambda _e: self.search_canvas.configure(
+                scrollregion=self.search_canvas.bbox("all")
+            ),
+        )
+        self._search_window = self.search_canvas.create_window(
+            (0, 0), window=self.search_list, anchor="nw"
+        )
+        # Rows are full-width so every ✕ button lines up on the right edge;
+        # a canvas window otherwise shrinks to its content.
+        self.search_canvas.bind(
+            "<Configure>",
+            lambda e: self.search_canvas.itemconfigure(
+                self._search_window, width=e.width
+            ),
+        )
+        self.search_canvas.configure(yscrollcommand=search_scroll.set)
+        self.search_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        search_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._show_empty_label()
+
+        control_row = ttk.Frame(self, padding=10)
+        control_row.pack(fill=tk.X)
 
         self.start_btn = ttk.Button(
-            connect_row, text="▶ Start", command=self._on_start_click
+            control_row, text="▶ Start All", command=self._on_start_click
         )
         self.start_btn.pack(side=tk.LEFT, padx=(0, 5))
 
         self.stop_btn = ttk.Button(
-            connect_row, text="■ Stop", command=self._on_stop_click,
+            control_row, text="■ Stop All", command=self._on_stop_click,
             state=tk.DISABLED,
         )
         self.stop_btn.pack(side=tk.LEFT)
 
-        header = ttk.Frame(self, padding=10)
-        header.pack(fill=tk.X)
-
-        self.league_label = ttk.Label(header, text="League: -", font=("Arial", 10, "bold"))
-        self.league_label.pack(side=tk.LEFT, padx=5)
-        self.search_id_label = ttk.Label(header, text="Search ID: -")
-        self.search_id_label.pack(side=tk.LEFT, padx=5)
-
-        self.status_label = ttk.Label(header, text="Not connected", foreground="gray")
+        # Per-search state lives in its row; this is the aggregate only.
+        self.status_label = ttk.Label(
+            control_row, text="No searches", foreground="gray",
+            font=("Arial", 10, "bold"),
+        )
         self.status_label.pack(side=tk.RIGHT, padx=5)
 
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
@@ -355,7 +454,29 @@ class TradeApp(tk.Tk):
         self.login_status.config(text=f"❌ {msg[:80]}", foreground="red")
         self.login_btn.config(state=tk.NORMAL)
 
-    # --------------------------------------------------------- Start/Stop --
+    # ---------------------------------------------------------- Searches --
+
+    SEARCH_LIST_HEIGHT = 108   # roughly five rows before the list scrolls
+
+    # Row dot colour per state, so one glance down the list says which
+    # searches are actually live. "rejected" is close code 1008 â the one that
+    # never heals on its own â so it gets a colour of its own instead of
+    # looking like a routine reconnect.
+    STATE_COLORS = {
+        "stopped": "gray",
+        "connecting": "orange",
+        "connected": "green",
+        "reconnecting": "orange",
+        "rejected": "red",
+    }
+
+    def _show_empty_label(self):
+        self.empty_label = ttk.Label(
+            self.search_list,
+            text="No searches yet — add a search ID or trade URL above.",
+            foreground="gray",
+        )
+        self.empty_label.pack(anchor="w", padx=4, pady=2)
 
     def _resolve_search(self, text, league):
         text = text.strip()
@@ -368,10 +489,30 @@ class TradeApp(tk.Tk):
             raise ValueError("Select a league, or paste a full trade URL instead.")
         return league, text
 
-    def _on_start_click(self):
-        if not self.poesessid:
-            messagebox.showwarning("Not logged in", "Click Import Cookies first.")
-            return
+    def _add_search_row(self, search):
+        if self.empty_label is not None:
+            self.empty_label.destroy()
+            self.empty_label = None
+
+        row = ttk.Frame(self.search_list)
+        row.pack(fill=tk.X, padx=2, pady=1)
+        search.row = row
+
+        search.dot = ttk.Label(row, text="○", foreground="gray", width=2)
+        search.dot.pack(side=tk.LEFT)
+
+        title = (
+            f"{search.name} — {search.target}" if search.name else search.target
+        )
+        ttk.Label(row, text=title).pack(side=tk.LEFT)
+
+        ttk.Button(
+            row, text="✕", width=3, command=lambda: self._remove_search(search)
+        ).pack(side=tk.RIGHT)
+        search.status_label = ttk.Label(row, text="stopped", foreground="gray")
+        search.status_label.pack(side=tk.RIGHT, padx=6)
+
+    def _on_add_click(self):
         try:
             league, search_id = self._resolve_search(
                 self.search_var.get(), self.league_var.get()
@@ -380,29 +521,126 @@ class TradeApp(tk.Tk):
             messagebox.showerror("Invalid input", str(e))
             return
 
-        self.league = league
-        self.search_id = search_id
-        self.league_label.config(text=f"League: {league}")
-        self.search_id_label.config(text=f"Search ID: {search_id}")
+        if any(s.league == league and s.search_id == search_id for s in self.searches):
+            messagebox.showinfo(
+                "Already added", f"{league}/{search_id} is already in the list."
+            )
+            return
+        if len(self.searches) >= MAX_SEARCHES:
+            messagebox.showwarning(
+                "Too many searches",
+                f"{MAX_SEARCHES} live searches is the cap — remove one first.",
+            )
+            return
+
+        search = Search(league, search_id, self.name_var.get().strip())
+        self.searches.append(search)
+        self._add_search_row(search)
+        self.search_var.set("")
+        self.name_var.set("")
+
+        # Added mid-session: connect it now. Otherwise picking up one new
+        # search would mean stopping and restarting every other one.
+        if self.is_running:
+            self._start_search(search)
+        self._refresh_summary()
+
+    def _remove_search(self, search):
+        self._stop_search(search)
+        if search in self.searches:
+            self.searches.remove(search)
+        if search.row is not None and search.row.winfo_exists():
+            search.row.destroy()
+        # Its socket thread may still be unwinding and post a status update;
+        # clearing these is what tells _set_search_status the row is gone.
+        search.row = search.dot = search.status_label = None
+        if not self.searches:
+            self._show_empty_label()
+        self._refresh_summary()
+
+    def _set_search_status(self, search, state, text=None):
+        """Thread-safe row update; also recomputes the aggregate status."""
+        def _apply():
+            search.state = state
+            color = self.STATE_COLORS.get(state, "gray")
+            dot = "○" if state == "stopped" else "●"
+            if search.dot is not None and search.dot.winfo_exists():
+                search.dot.config(text=dot, foreground=color)
+            if search.status_label is not None and search.status_label.winfo_exists():
+                search.status_label.config(text=text or state, foreground=color)
+            self._refresh_summary()
+
+        self.after(0, _apply)
+
+    def _refresh_summary(self):
+        total = len(self.searches)
+        if total == 0:
+            self.status_label.config(text="No searches", foreground="gray")
+            return
+        plural = "search" if total == 1 else "searches"
+        if not self.is_running:
+            self.status_label.config(
+                text=f"{total} {plural} — stopped", foreground="gray"
+            )
+            return
+        live = sum(1 for s in self.searches if s.state == "connected")
+        if live == total:
+            color = "green"
+        elif any(s.state == "rejected" for s in self.searches):
+            color = "red"
+        else:
+            color = "orange"
+        self.status_label.config(
+            text=f"⚡ {live}/{total} connected", foreground=color
+        )
+
+    # --------------------------------------------------------- Start/Stop --
+
+    def _start_search(self, search):
+        if search.is_running:
+            return
+        search.is_running = True
+        self._set_search_status(search, "connecting", "connecting…")
+        search.thread = threading.Thread(
+            target=self._listen_websocket, args=(search,), daemon=True
+        )
+        search.thread.start()
+
+    def _stop_search(self, search):
+        search.is_running = False
+        if search.ws is not None:
+            # Closing from here is what unblocks the ws.recv() its own thread
+            # is parked on; the loop then sees is_running False and exits.
+            try:
+                search.ws.close()
+            except Exception:
+                pass
+        self._set_search_status(search, "stopped")
+
+    def _on_start_click(self):
+        if not self.poesessid:
+            messagebox.showwarning("Not logged in", "Click Import Cookies first.")
+            return
+        if not self.searches:
+            messagebox.showwarning(
+                "No searches", "Add at least one search ID or trade URL first."
+            )
+            return
 
         self.is_running = True
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.status_label.config(text="Connecting...", foreground="orange")
-
-        self.ws_thread = threading.Thread(target=self._listen_websocket, daemon=True)
-        self.ws_thread.start()
+        for search in self.searches:
+            self._start_search(search)
+        self._refresh_summary()
 
     def _on_stop_click(self):
         self.is_running = False
-        if self.current_ws is not None:
-            try:
-                self.current_ws.close()
-            except Exception:
-                pass
+        for search in self.searches:
+            self._stop_search(search)
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="Stopped", foreground="gray")
+        self._refresh_summary()
 
     # --------------------------------------------------------------- Ping --
 
@@ -471,8 +709,10 @@ class TradeApp(tk.Tk):
         """Renders an item card with a manual action button."""
         self._ping()
 
+        # Titled with the search tag so a card is attributable at a glance
+        # when several searches are feeding the same list.
         card = ttk.LabelFrame(
-            self.scroll_frame, text=item["name"], padding=10
+            self.scroll_frame, text=f"[{item['search']}] {item['name']}", padding=10
         )
         existing = self.scroll_frame.pack_slaves()
         if existing:
@@ -588,8 +828,12 @@ class TradeApp(tk.Tk):
 
     # -------------------------------------------------------- WebSocket --
 
-    def _listen_websocket(self):
-        ws_url = f"wss://www.pathofexile.com/api/trade/live/{self.league}/{self.search_id}"
+    def _listen_websocket(self, search):
+        """Reconnect loop for one search, on that search's own daemon thread."""
+        ws_url = (
+            "wss://www.pathofexile.com/api/trade/live/"
+            f"{search.league}/{search.search_id}"
+        )
         # Only send headers a real browser WebSocket handshake can produce
         # (no X-Requested-With / Referer — those don't exist on WS upgrades
         # and are a bot-detection tripwire). This route is proxied through
@@ -611,23 +855,25 @@ class TradeApp(tk.Tk):
 
         WS_CLOSE_OPCODE = 8
 
-        while self.is_running:
+        while search.is_running:
             reason = ""
+            code = None
             session = None
             try:
                 session = cffi_requests.Session(impersonate=self.ws_impersonate)
                 ws = session.ws_connect(ws_url, headers=headers)
-                self.current_ws = ws
+                search.ws = ws
 
-                self._set_ws_status("⚡ Connected (Listening)", "green")
+                self._set_search_status(search, "connected", "connected")
 
-                while self.is_running:
+                while search.is_running:
                     msg, opcode = ws.recv()
 
                     if opcode == WS_CLOSE_OPCODE:
                         # Server closed the connection — msg here is a raw
                         # 2-byte close code, not JSON. Reconnect.
-                        reason = self._close_reason(ws.close_code)
+                        code = ws.close_code
+                        reason = self._close_reason(code)
                         break
 
                     data = json.loads(msg)
@@ -637,17 +883,17 @@ class TradeApp(tk.Tk):
                     # like whisper_token) that must be handed straight to the
                     # fetch endpoint in place of an ID list.
                     if "result" in data and isinstance(data["result"], str):
-                        self._fetch_items(data["result"])
+                        self._fetch_items(search, data["result"])
 
             except Exception as e:
-                if self.is_running:
-                    print(f"WebSocket error: {e!r}")
+                if search.is_running:
+                    print(f"WebSocket error ({search.target}): {e!r}")
                     # Acking a close frame can itself fail if the peer is
                     # already gone; the code it sent is still the useful part.
-                    code = getattr(self.current_ws, "close_code", None)
+                    code = getattr(search.ws, "close_code", None)
                     reason = self._close_reason(code) or type(e).__name__
             finally:
-                self.current_ws = None
+                search.ws = None
                 if session is not None:
                     # Not closing this leaks a libcurl handle per reconnect.
                     try:
@@ -655,14 +901,17 @@ class TradeApp(tk.Tk):
                     except Exception:
                         pass
 
-            if not self.is_running:
+            if not search.is_running:
                 break
 
             # The reason matters: an idle 1000 is routine, whereas a repeating
             # 1008 means the cookies/fingerprint were rejected and reconnecting
             # will never fix itself. Without it every failure looks identical.
-            text = "Reconnecting..." if not reason else f"Reconnecting… ({reason})"
-            self._set_ws_status(text, "orange")
+            # A 1008 on one row while the others stay green also narrows the
+            # cause: it is that search, not the session.
+            text = "reconnecting…" if not reason else f"reconnecting — {reason}"
+            state = "rejected" if code == 1008 else "reconnecting"
+            self._set_search_status(search, state, text)
             time.sleep(2)
 
     # WebSocket close codes worth naming; anything else is shown as-is.
@@ -681,19 +930,18 @@ class TradeApp(tk.Tk):
             return ""
         return self.CLOSE_REASONS.get(code, f"closed {code}")
 
-    def _set_ws_status(self, text, color):
-        self.after(0, lambda: self.status_label.config(text=text, foreground=color))
-
-    def _fetch_items(self, result_token):
+    def _fetch_items(self, search, result_token):
         """Retrieves item metadata and whisper token from GGG API.
 
         result_token is the short-lived signed token from the live-search
-        push message, used in place of a raw comma-separated ID list.
+        push message, used in place of a raw comma-separated ID list. The
+        query parameter has to be *this* search's ID — a token from one
+        search does not fetch against another.
         """
         headers = self._api_headers()
         fetch_url = (
             f"https://www.pathofexile.com/api/trade/fetch/{result_token}"
-            f"?query={self.search_id}"
+            f"?query={search.search_id}"
         )
 
         try:
@@ -717,6 +965,7 @@ class TradeApp(tk.Tk):
                 ).strip()
 
                 parsed_item = {
+                    "search": search.label,
                     "name": item_name,
                     "price": price_str or "Unpriced",
                     "seller": listing.get("account", {}).get("name", "Unknown"),
